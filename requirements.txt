@@ -1,0 +1,20 @@
+# --- Interface Gráfica (UI) ---
+customtkinter
+tkinterdnd2-universal  # Opcional, para suporte a drag-and-drop futuro
+
+# --- Processamento de Documentos ---
+PyMuPDF                # Extração de texto de PDFs (importado como fitz)
+ebooklib               # Leitura de ficheiros EPUB
+beautifulsoup4         # Limpeza de tags HTML de EPUBs
+
+# --- Comunicação e API ---
+requests               # Chamadas à API do Ollama
+
+# --- IA e Síntese de Voz (TTS) ---
+torch                  # Base para modelos transformer
+qwen-tts               # Biblioteca principal para Qwen3-TTS
+numpy                  # Manipulação de matrizes de áudio
+soundfile              # Gravação de ficheiros .wav
+
+# --- Utilidades ---
+pathlib                # Gestão de caminhos de ficheiros
