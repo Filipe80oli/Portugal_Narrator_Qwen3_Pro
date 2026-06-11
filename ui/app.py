@@ -1,5 +1,5 @@
 # ui/app.py
-# ─── Janela principal da aplicação ────────────────────────────────────────────
+# ─── Janela principal — suporta modos Narrador / Novela / Cinema ──────────────
 
 import os
 import asyncio
@@ -12,7 +12,10 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
-from config.settings import TEMP_DIR, OLLAMA_BASE_URL, DEFAULT_NARRATOR
+from config.settings import (
+    TEMP_DIR, OLLAMA_BASE_URL, DEFAULT_NARRATOR,
+    PRODUCTION_MODES, PRODUCTION_MODE_IDS,
+)
 from core.extractor import extract_text
 from core.analysis_cache import (
     get_analysis_path, compute_book_hash,
@@ -27,27 +30,49 @@ from tts.exporter import create_m4b
 
 logger = logging.getLogger(__name__)
 
+# Descrições dos modos para a UI
+MODE_DESCRIPTIONS = {
+    "narrator": (
+        "Uma única voz narra todo o texto. "
+        "Ideal para leituras simples, poesia ou documentários."
+    ),
+    "novela":   (
+        "Cada personagem tem a sua própria voz. "
+        "O Ollama identifica automaticamente quem fala em cada segmento."
+    ),
+    "cinema":   (
+        "Novela completa com vozes múltiplas + efeitos sonoros + música. "
+        "O Ollama deteta os sons descritos no texto e adiciona-os no momento exato."
+    ),
+}
+
 
 class AudiobookApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Portugal Narrator Qwen3 Pro v7.3 - Dual Model")
-        self.geometry("1100x1100")
+        self.geometry("1100x1200")
 
         self.ollama_base_url = OLLAMA_BASE_URL
-        self.ollama_url = f"{self.ollama_base_url}/api/generate"
-        self.model_name = "qwen2.5:7b"
-        self.file_path = ""
-        self.cover_path = ""
-        self.temp_dir = TEMP_DIR
+        self.ollama_url      = f"{self.ollama_base_url}/api/generate"
+        self.model_name      = "qwen2.5:7b"
+        self.file_path       = ""
+        self.cover_path      = ""
+        self.temp_dir        = TEMP_DIR
 
-        self.characters = {}
-        self.segments = []
-        self.raw_text = ""
+        self.characters  = {}
+        self.segments    = []
+        self.raw_text    = ""
         self.current_analysis_file = None
 
-        self.tts = TTSEngine(temp_dir=self.temp_dir, log_fn=self.log)
+        # Eventos sonoros detetados (lista paralela a self.segments)
+        self.sound_events: list[dict] = []
+
+        self.tts         = TTSEngine(temp_dir=self.temp_dir, log_fn=self.log)
         self.voice_cache = {}
+
+        # Modo de produção ativo
+        self._production_mode = "novela"
 
         self._build_ui()
 
@@ -56,18 +81,61 @@ class AudiobookApp(ctk.CTk):
     # ═══════════════════════════════════════════════════════════════════════════
     def _build_ui(self):
         from ui.widgets import (
-            build_header, build_file_section, build_ollama_section,
-            build_action_section, build_character_section,
+            build_header, build_file_section, build_production_mode_section,
+            build_ollama_section, build_action_section, build_character_section,
             build_audio_controls, build_progress_section
         )
+        from ui.sound_panel import build_sound_panel
+
         self.grid_columnconfigure(0, weight=1)
         build_header(self)
         build_file_section(self)
+        # IMPORTANTE: build_production_mode_section chama _on_production_mode_changed
+        # que chama _update_mode_visibility — os outros widgets ainda nao existem,
+        # por isso _update_mode_visibility usa hasattr para proteger os acessos.
+        build_production_mode_section(self)
         build_ollama_section(self)
         build_action_section(self)
         build_character_section(self)
+        build_sound_panel(self)   # cria sound_frame_outer
         build_audio_controls(self)
         build_progress_section(self)
+
+        # Agora todos os widgets existem -- aplicar visibilidade correta
+        self._update_mode_visibility()
+
+    # ─── Modo de Produção ────────────────────────────────────────────────────
+    def _on_production_mode_changed(self, selected_label: str):
+        idx = PRODUCTION_MODES.index(selected_label)
+        self._production_mode = PRODUCTION_MODE_IDS[idx]
+        desc = MODE_DESCRIPTIONS.get(self._production_mode, "")
+        self.label_mode_desc.configure(text=desc)
+        self._update_mode_visibility()
+
+    def _update_mode_visibility(self):
+        """
+        Mostra/oculta paineis conforme o modo de producao.
+        Seguro para chamadas antes de todos os widgets estarem criados.
+        """
+        mode = self._production_mode
+
+        # ── Painel de personagens (char_scroll) ───────────────────────────────
+        if not hasattr(self, "char_scroll"):
+            return   # widgets ainda nao criados -- nova chamada vem do _build_ui
+
+        if mode == "narrator":
+            self.char_scroll.pack_forget()
+        else:
+            self.char_scroll.pack(padx=20, fill="x")
+
+        # ── Painel de sons (sound_frame_outer) ────────────────────────────────
+        if not hasattr(self, "sound_frame_outer"):
+            return
+
+        if mode == "cinema":
+            self.sound_frame_outer.pack(pady=5, padx=20, fill="x")
+        else:
+            self.sound_frame_outer.pack_forget()
 
     # ─── Helpers UI ──────────────────────────────────────────────────────────
     def log(self, text: str):
@@ -91,7 +159,8 @@ class AudiobookApp(ctk.CTk):
         file = filedialog.askopenfilename(filetypes=[("Livros", "*.txt;*.pdf;*.epub")])
         if file:
             self.file_path = file
-            self.label_file_info.configure(text=f"📖 {os.path.basename(file)}", text_color="#3498db")
+            self.label_file_info.configure(
+                text=f"📖 {os.path.basename(file)}", text_color="#3498db")
             self.entry_title.delete(0, tk.END)
             self.entry_title.insert(0, Path(file).stem)
 
@@ -109,6 +178,23 @@ class AudiobookApp(ctk.CTk):
         file = filedialog.askopenfilename(filetypes=[("Imagens", "*.jpg;*.jpeg;*.png")])
         if file:
             self.cover_path = file
+
+    def _open_sounds_folder(self):
+        from config.settings import SOUNDS_DIR
+        SOUNDS_DIR.mkdir(exist_ok=True)
+        import subprocess, sys
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", str(SOUNDS_DIR)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(SOUNDS_DIR)])
+        else:
+            subprocess.Popen(["xdg-open", str(SOUNDS_DIR)])
+        # Recarregar DB após fechar o explorador (próxima ação)
+        from cinema.sound_db import get_db
+        db = get_db()
+        db.reload()
+        self.label_sounds_db.configure(
+            text=f"DB: {db.total} sons disponíveis")
 
     def refresh_models(self):
         self.available_models = get_ollama_models(self.ollama_base_url)
@@ -131,8 +217,11 @@ class AudiobookApp(ctk.CTk):
                     return
 
         self.characters = data.get("characters", {})
-        self.segments = sanitize_segments(data.get("segments", []))
+        self.segments   = sanitize_segments(data.get("segments", []))
         self.current_analysis_file = analysis_path
+
+        # Carregar eventos sonoros se existirem no JSON
+        self.sound_events = data.get("sound_events", [])
 
         if self.file_path and not self.raw_text:
             self.raw_text = extract_text(self.file_path)
@@ -140,22 +229,26 @@ class AudiobookApp(ctk.CTk):
         self.log(f"📂 Análise carregada: {Path(analysis_path).name}")
         self.log(f"   📊 {len(self.characters)} personagens, {len(self.segments)} segmentos")
         self.log(f"   📅 Criada em: {data.get('created_at', 'desconhecido')}")
+        if self.sound_events:
+            self.log(f"   🔊 {sum(len(e.get('sounds',[])) for e in self.sound_events)} eventos sonoros carregados")
 
         self.after(0, self._display_characters)
+        self.after(0, self._display_sound_events)
         self.after(0, lambda: self.btn_generate.configure(state="normal"))
 
     def load_analysis_from_file(self):
         file = filedialog.askopenfilename(
             title="Selecionar Análise",
-            filetypes=[("Análises JSON", "*.analysis.json"), ("JSON", "*.json"), ("Todos", "*.*")],
+            filetypes=[("Análises JSON", "*.analysis.json"),
+                       ("JSON", "*.json"), ("Todos", "*.*")],
             initialdir=str(Path("analyses"))
         )
         if file:
             try:
                 import json
                 with open(file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                book_file = data.get("book_file", "")
+                    d = json.load(f)
+                book_file = d.get("book_file", "")
                 if book_file and Path(book_file).exists() and not self.file_path:
                     self.file_path = book_file
                     self.label_file_info.configure(
@@ -167,7 +260,7 @@ class AudiobookApp(ctk.CTk):
             self._load_analysis_data(file)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # FASE 1: ANÁLISE
+    # FASE 1: ANÁLISE DO LIVRO
     # ═══════════════════════════════════════════════════════════════════════════
     def start_analysis(self):
         if not self.file_path:
@@ -200,31 +293,45 @@ class AudiobookApp(ctk.CTk):
             self.log("❌ Texto vazio.")
             return
 
-        blocks = split_into_blocks(self.raw_text, max_chars=4000)
-        self.log(f"📊 Texto dividido em {len(blocks)} blocos para análise.")
+        mode = self._production_mode
 
-        all_characters, all_segments = {}, []
-        for i, block in enumerate(blocks):
-            self.set_progress(0.1 + 0.7 * (i / len(blocks)),
-                              f"Analisando bloco {i+1}/{len(blocks)}...")
-            self.log(f"🔍 Analisando bloco {i+1}/{len(blocks)} ({len(block)} chars)...")
+        # Modo Narrador: não precisa de análise de personagens
+        if mode == "narrator":
+            self.characters = {"narrator": DEFAULT_NARRATOR.copy()}
+            # Segmentos simples: cada parágrafo → narrador
+            paragraphs = [p.strip() for p in self.raw_text.split('\n\n') if p.strip()]
+            self.segments = [
+                {"text": p, "character_id": "narrator",
+                 "emotion": "neutral", "pace": 1.0, "pause_ms": 0}
+                for p in paragraphs
+            ]
+            self.log(f"✨ Modo Narrador: {len(self.segments)} parágrafos.")
+        else:
+            # Novela / Cinema: análise completa com Ollama
+            blocks = split_into_blocks(self.raw_text, max_chars=4000)
+            self.log(f"📊 Texto dividido em {len(blocks)} blocos para análise.")
 
-            context = "\n".join(blocks[max(0, i-1):i])
-            result = await analyze_block(
-                self.ollama_url, self.model_name, block, context, all_characters
-            )
-            if result:
-                for cid, cdata in result.get("characters", {}).items():
-                    if cid not in all_characters:
-                        all_characters[cid] = cdata
-                all_segments.extend(result.get("segments", []))
+            all_characters, all_segments = {}, []
+            for i, block in enumerate(blocks):
+                self.set_progress(0.1 + 0.7 * (i / len(blocks)),
+                                  f"Analisando bloco {i+1}/{len(blocks)}...")
+                self.log(f"🔍 Bloco {i+1}/{len(blocks)} ({len(block)} chars)...")
+                context = "\n".join(blocks[max(0, i-1):i])
+                result  = await analyze_block(
+                    self.ollama_url, self.model_name, block, context, all_characters)
+                if result:
+                    for cid, cdata in result.get("characters", {}).items():
+                        if cid not in all_characters:
+                            all_characters[cid] = cdata
+                    all_segments.extend(result.get("segments", []))
 
-        self.characters = all_characters
-        self.segments = sanitize_segments(all_segments)
-        self.log(f"✨ Análise concluída: {len(self.characters)} personagens, {len(self.segments)} segmentos.")
+            self.characters = all_characters
+            self.segments   = sanitize_segments(all_segments)
 
-        if "narrator" not in self.characters:
-            self.characters["narrator"] = DEFAULT_NARRATOR.copy()
+            if "narrator" not in self.characters:
+                self.characters["narrator"] = DEFAULT_NARRATOR.copy()
+
+            self.log(f"✨ Análise concluída: {len(self.characters)} personagens, {len(self.segments)} segmentos.")
 
         saved = save_analysis(
             self.file_path, self.raw_text,
@@ -238,12 +345,82 @@ class AudiobookApp(ctk.CTk):
         self.after(0, lambda: self.btn_generate.configure(state="normal"))
         self.set_progress(1.0, "Análise concluída! Configura as vozes e clica em GERAR.")
 
+        # Modo Cinema: lançar análise de sons automaticamente após análise do livro
+        if mode == "cinema":
+            self.after(500, self.start_sound_analysis)
+
     # ═══════════════════════════════════════════════════════════════════════════
-    # FASE 2: EXIBIR PERSONAGENS
+    # FASE 1b: ANÁLISE DE SONS (apenas Cinema)
+    # ═══════════════════════════════════════════════════════════════════════════
+    def start_sound_analysis(self):
+        if not self.segments:
+            messagebox.showwarning("Atenção", "Analisa o livro primeiro.")
+            return
+        self.btn_analyze_sounds.configure(state="disabled")
+        threading.Thread(target=self._run_sound_analysis, daemon=True).start()
+
+    def _run_sound_analysis(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._analyze_sounds())
+        except Exception as e:
+            logger.error(f"Erro na análise de sons: {e}")
+            self.log(f"❌ Erro sons: {e}")
+        finally:
+            self.after(0, lambda: self.btn_analyze_sounds.configure(state="normal"))
+
+    async def _analyze_sounds(self):
+        from cinema.sound_analyzer import analyze_sounds_batch
+        from cinema.sound_db import get_db
+
+        db = get_db()
+        self.log(f"🔊 A analisar sons em {len(self.segments)} segmentos... (DB: {db.total} sons)")
+        self.label_sounds_db.configure(text=f"DB: {db.total} sons disponíveis")
+
+        self.sound_events = await analyze_sounds_batch(
+            self.ollama_url, self.model_name,
+            self.segments,
+            progress_fn=self.set_progress
+        )
+
+        total_sfx   = sum(len(e.get("sounds", [])) for e in self.sound_events)
+        total_music = sum(1 for e in self.sound_events if e.get("music"))
+        self.log(f"✅ Sons detetados: {total_sfx} efeitos, {total_music} momentos musicais.")
+
+        # Guardar eventos sonoros no JSON de análise
+        if self.current_analysis_file:
+            import json
+            try:
+                with open(self.current_analysis_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                data["sound_events"] = self.sound_events
+                with open(self.current_analysis_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                self.log("💾 Eventos sonoros guardados na análise.")
+            except Exception as e:
+                self.log(f"⚠️ Erro ao guardar sons: {e}")
+
+        self.after(0, self._display_sound_events)
+        self.set_progress(1.0, "Análise de sons concluída!")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FASE 2: EXIBIR PERSONAGENS / SONS
     # ═══════════════════════════════════════════════════════════════════════════
     def _display_characters(self):
+        mode = self._production_mode
+        if mode == "narrator":
+            return   # sem painel de personagens no modo narrador
         from ui.character_panel import display_characters
         display_characters(self)
+
+    def _display_sound_events(self):
+        if self._production_mode != "cinema":
+            return
+        if not self.sound_events:
+            return
+        from ui.sound_panel import display_sound_events
+        display_sound_events(self, self.sound_events)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # FASE 3: GERAR AUDIOBOOK
@@ -271,17 +448,23 @@ class AudiobookApp(ctk.CTk):
             self.after(0, lambda: self.btn_analyze.configure(state="normal"))
 
     async def _generate_audiobook(self):
-        self.log("🧬 A preparar vozes e a garantir consistência...")
+        mode = self._production_mode
+        self.log(f"🎬 Modo: {mode.upper()}")
+        self.log("🧬 A preparar vozes...")
 
         await self.tts.load_base()
         await self.tts.load_voicedesign()
 
-        for cid, cdata in self.characters.items():
-            # Capturar descrição da UI antes de gerar âncora
+        # Em modo Narrador: apenas a voz do narrador
+        if mode == "narrator":
+            chars_to_prepare = {"narrator": self.characters.get("narrator", DEFAULT_NARRATOR.copy())}
+        else:
+            chars_to_prepare = self.characters
+
+        for cid, cdata in chars_to_prepare.items():
             if cid in self.char_widgets:
-                widget_data = self.characters[cid]
-                if "_desc_entry" in widget_data:
-                    cdata["description"] = widget_data["_desc_entry"].get()
+                if "_desc_entry" in self.characters.get(cid, {}):
+                    cdata["description"] = self.characters[cid]["_desc_entry"].get()
             await self.tts.ensure_anchor(cid, cdata)
 
         self.log(f"🎙️ Vozes fixadas. A gerar {len(self.segments)} segmentos...")
@@ -289,30 +472,62 @@ class AudiobookApp(ctk.CTk):
         s_para = self.tts.create_silence(0.6, "s_para.wav")
 
         for i, seg in enumerate(self.segments):
-            self.set_progress(i / len(self.segments), f"Segmento {i+1}/{len(self.segments)}")
+            self.set_progress(i / len(self.segments),
+                              f"Segmento {i+1}/{len(self.segments)}")
 
             if not isinstance(seg, dict):
                 continue
             text    = seg.get("text", "").strip()
-            cid     = seg.get("character_id", "narrator")
             emotion = seg.get("emotion", "neutral")
             pace    = float(seg.get("pace", 1.0)) * float(self.speed_slider.get())
 
             if not text:
                 continue
 
-            cdata = self.characters.get(cid, self.characters.get("narrator", {}))
+            # Modo Narrador: sempre usa a voz do narrador
+            if mode == "narrator":
+                cid   = "narrator"
+                cdata = self.characters.get("narrator", DEFAULT_NARRATOR.copy())
+            else:
+                cid   = seg.get("character_id", "narrator")
+                cdata = self.characters.get(cid, self.characters.get("narrator", {}))
+
             out_wav = self.temp_dir / f"seg_{i:05d}.wav"
-            self.log(f"  [{i+1}/{len(self.segments)}] {cdata.get('name')} ({emotion}): {text[:40]}...")
+            self.log(
+                f"  [{i+1}/{len(self.segments)}] "
+                f"{cdata.get('name','?')} ({emotion}): {text[:40]}...")
 
             success = await asyncio.to_thread(
                 self.tts.clone_with_emotion,
                 text, cdata.get("ref_audio"), emotion, pace, str(out_wav),
-                cdata.get("ref_text", "")   # transcrição da âncora (ICL) ou "" (x_vector)
+                cdata.get("ref_text", "")
             )
-            if success:
-                audio_sequence.append(out_wav)
-                audio_sequence.append(s_para)
+
+            if not success:
+                continue
+
+            final_wav = str(out_wav)
+
+            # Modo Cinema: mixar com sons e música
+            if mode == "cinema":
+                sound_data = (self.sound_events[i]
+                              if i < len(self.sound_events) else {"sounds": [], "music": None})
+
+                # Ler valores editados pelo utilizador no painel de sons
+                sound_data = _read_sound_panel_values(sound_data)
+
+                if sound_data.get("sounds") or sound_data.get("music"):
+                    from cinema.mixer import apply_cinema_mix
+                    self.log(f"   🎬 Mixando {len(sound_data.get('sounds',[]))} sons"
+                             f"{' + 🎵' if sound_data.get('music') else ''}...")
+                    final_wav = await asyncio.to_thread(
+                        apply_cinema_mix,
+                        final_wav, sound_data,
+                        self.temp_dir, i, self.log
+                    )
+
+            audio_sequence.append(final_wav)
+            audio_sequence.append(str(s_para))
 
         if audio_sequence:
             title  = self.entry_title.get() or "Audiobook"
@@ -321,3 +536,30 @@ class AudiobookApp(ctk.CTk):
             if ok:
                 self.after(0, lambda: messagebox.showinfo(
                     "Sucesso", f"Audiobook criado:\n{title}.m4b"))
+
+
+# ─── Utilitário: lê valores editados pelo utilizador no painel de sons ────────
+def _read_sound_panel_values(sound_data: dict) -> dict:
+    """Substitui os valores dos eventos sonoros pelos das widgets (se editados)."""
+    result = {"sounds": [], "music": sound_data.get("music")}
+
+    for ev in sound_data.get("sounds", []):
+        new_ev = dict(ev)
+        if "_name_var" in ev:
+            new_ev["sound"] = ev["_name_var"].get()
+        if "_pos_var" in ev:
+            new_ev["position"] = ev["_pos_var"].get()
+        if "_vol_var" in ev:
+            new_ev["volume"] = ev["_vol_var"].get()
+        result["sounds"].append(new_ev)
+
+    music = sound_data.get("music")
+    if music:
+        new_music = dict(music)
+        if "_name_var" in music:
+            new_music["music"] = music["_name_var"].get()
+        if "_vol_var" in music:
+            new_music["music_volume"] = music["_vol_var"].get()
+        result["music"] = new_music
+
+    return result

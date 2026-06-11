@@ -14,8 +14,17 @@ ANALYSIS_DIR.mkdir(exist_ok=True)
 TEMP_DIR = Path("temp_audio_chunks")
 TEMP_DIR.mkdir(exist_ok=True)
 
+# Base de dados de sons (modo Cinema)
+# Estrutura recomendada:
+#   sounds/nature/rain_heavy.wav
+#   sounds/nature/thunder.wav
+#   sounds/city/traffic.wav
+#   sounds/music/dramatic.wav   ← música de fundo
+SOUNDS_DIR = Path("sounds")
+SOUNDS_DIR.mkdir(exist_ok=True)
+
 # Ollama
-OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_BASE_URL      = "http://localhost:11434"
 DEFAULT_OLLAMA_MODEL = "qwen2.5:7b"
 
 # Narrador padrão
@@ -39,3 +48,35 @@ ANCHOR_TEXT = (
     "Estou a falar com o sotaque de Lisboa, em Portugal. "
     "Esta é a minha voz europeia."
 )
+
+# ─── Modos de Produção ────────────────────────────────────────────────────────
+# "narrator" : uma só voz para todo o texto
+# "novela"   : múltiplas vozes por personagem
+# "cinema"   : novela + música ambiente + efeitos sonoros detetados pelo Ollama
+PRODUCTION_MODES    = ["🎙️ Narrador", "🎭 Novela", "🎬 Cinema"]
+PRODUCTION_MODE_IDS = ["narrator",    "novela",    "cinema"]
+
+# ─── Cinema: volumes de mixagem ───────────────────────────────────────────────
+CINEMA_VOICE_VOL             =   0    # dB (sem alteração)
+CINEMA_SFX_VOL               =  -6    # efeitos 6 dB abaixo da voz
+CINEMA_MUSIC_VOL             = -18    # música de fundo bem abaixo
+
+CINEMA_SFX_DEFAULT_DURATION  = 2.0   # segundos
+CINEMA_MUSIC_DEFAULT_DURATION = 8.0
+
+# ─── Categorias de sons (para fallback na DB) ─────────────────────────────────
+SOUND_CATEGORIES = {
+    "nature":   ["rain", "thunder", "wind", "sea", "river", "fire", "birds",
+                 "forest", "storm", "snow", "leaves"],
+    "city":     ["traffic", "crowd", "sirens", "construction", "market",
+                 "cafe", "subway", "clock", "bell"],
+    "interior": ["door_open", "door_close", "door_knock", "footsteps",
+                 "phone_ring", "glass_break", "typing", "clock_ticking",
+                 "fire_crackle", "chair_creak"],
+    "action":   ["explosion", "gunshot", "fight", "horse", "sword",
+                 "car_crash", "scream", "run"],
+    "ambience": ["silence", "night", "morning", "tension", "mystery",
+                 "romantic", "sad", "happy", "dramatic"],
+    "music":    ["dramatic", "romantic", "tense", "sad", "happy",
+                 "mystery", "action", "peaceful", "epic"],
+}

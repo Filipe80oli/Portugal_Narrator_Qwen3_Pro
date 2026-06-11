@@ -3,6 +3,7 @@
 
 import customtkinter as ctk
 from core.ollama_analyzer import get_ollama_models
+from config.settings import PRODUCTION_MODES, PRODUCTION_MODE_IDS
 
 
 def build_header(app):
@@ -34,6 +35,40 @@ def build_file_section(app):
     app.label_file_info = ctk.CTkLabel(file_frame, text="Nenhum",
                                         text_color="#888", font=("Roboto", 11))
     app.label_file_info.grid(row=1, column=0, columnspan=2, padx=5)
+
+
+def build_production_mode_section(app):
+    """Selector dos 3 modos de produção com descrição dinâmica."""
+    outer = ctk.CTkFrame(app)
+    outer.pack(pady=8, padx=20, fill="x")
+
+    ctk.CTkLabel(outer, text="Modo de Produção:",
+                 font=("Roboto", 13, "bold")).pack(side="left", padx=12)
+
+    # Segmented button — escolha exclusiva
+    app.production_mode_var = ctk.StringVar(value=PRODUCTION_MODES[1])  # default: Novela
+
+    seg_btn = ctk.CTkSegmentedButton(
+        outer,
+        values=PRODUCTION_MODES,
+        variable=app.production_mode_var,
+        command=app._on_production_mode_changed,
+        font=("Roboto", 13, "bold"),
+        height=38,
+        selected_color="#8e44ad",
+        selected_hover_color="#7d3c98",
+    )
+    seg_btn.pack(side="left", padx=10)
+
+    # Descrição do modo selecionado
+    app.label_mode_desc = ctk.CTkLabel(
+        outer, text="", font=("Roboto", 11),
+        text_color="#bdc3c7", wraplength=380, justify="left"
+    )
+    app.label_mode_desc.pack(side="left", padx=14, fill="x", expand=True)
+
+    # Inicializar descrição
+    app._on_production_mode_changed(PRODUCTION_MODES[1])
 
 
 def build_ollama_section(app):
@@ -84,7 +119,7 @@ def build_character_section(app):
     ctk.CTkLabel(app, text="🎭 Personagens Detetados & Configuração de Voz",
                  font=("Roboto", 14, "bold"), text_color="#f39c12").pack(pady=(10, 5))
 
-    app.char_scroll = ctk.CTkScrollableFrame(app, height=280)
+    app.char_scroll = ctk.CTkScrollableFrame(app, height=230)
     app.char_scroll.pack(padx=20, fill="x")
     app.char_widgets = {}
 
@@ -115,5 +150,5 @@ def build_progress_section(app):
     app.progress_bar.pack(pady=(5, 3), padx=20, fill="x")
     app.label_progress = ctk.CTkLabel(app, text="", font=("Roboto", 11), text_color="#888")
     app.label_progress.pack()
-    app.textbox = ctk.CTkTextbox(app, width=1050, height=180, font=("Consolas", 11))
+    app.textbox = ctk.CTkTextbox(app, width=1050, height=160, font=("Consolas", 11))
     app.textbox.pack(pady=10, padx=20)
