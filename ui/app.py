@@ -1,17 +1,13 @@
-# ui/app.py
 # ─── Janela principal — suporta modos Narrador / Novela / Cinema ──────────────
-
 import os
 import asyncio
 import threading
 import logging
 from pathlib import Path
 from datetime import datetime
-
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
-
 from config.settings import (
     TEMP_DIR, OLLAMA_BASE_URL, DEFAULT_NARRATOR,
     PRODUCTION_MODES, PRODUCTION_MODE_IDS,
@@ -46,11 +42,10 @@ MODE_DESCRIPTIONS = {
     ),
 }
 
-
 class AudiobookApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Portugal Narrator Qwen3 Pro v7.3 - Dual Model")
+        self.title("Portugal Narrator Qwen3 Pro v7.4 - Dual Model")
         self.geometry("1100x1200")
 
         self.ollama_base_url = OLLAMA_BASE_URL
@@ -82,7 +77,7 @@ class AudiobookApp(ctk.CTk):
     def _build_ui(self):
         from ui.widgets import (
             build_header, build_file_section, build_production_mode_section,
-            build_ollama_section, build_action_section, build_character_section,
+            build_ollama_section, build_action_section,  build_character_section,
             build_audio_controls, build_progress_section
         )
         from ui.sound_panel import build_sound_panel
@@ -90,9 +85,6 @@ class AudiobookApp(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         build_header(self)
         build_file_section(self)
-        # IMPORTANTE: build_production_mode_section chama _on_production_mode_changed
-        # que chama _update_mode_visibility — os outros widgets ainda nao existem,
-        # por isso _update_mode_visibility usa hasattr para proteger os acessos.
         build_production_mode_section(self)
         build_ollama_section(self)
         build_action_section(self)
@@ -104,7 +96,6 @@ class AudiobookApp(ctk.CTk):
         # Agora todos os widgets existem -- aplicar visibilidade correta
         self._update_mode_visibility()
 
-    # ─── Modo de Produção ────────────────────────────────────────────────────
     def _on_production_mode_changed(self, selected_label: str):
         idx = PRODUCTION_MODES.index(selected_label)
         self._production_mode = PRODUCTION_MODE_IDS[idx]
@@ -119,16 +110,14 @@ class AudiobookApp(ctk.CTk):
         """
         mode = self._production_mode
 
-        # ── Painel de personagens (char_scroll) ───────────────────────────────
         if not hasattr(self, "char_scroll"):
-            return   # widgets ainda nao criados -- nova chamada vem do _build_ui
+            return
 
         if mode == "narrator":
             self.char_scroll.pack_forget()
         else:
             self.char_scroll.pack(padx=20, fill="x")
 
-        # ── Painel de sons (sound_frame_outer) ────────────────────────────────
         if not hasattr(self, "sound_frame_outer"):
             return
 
@@ -142,7 +131,7 @@ class AudiobookApp(ctk.CTk):
         self.after(0, self._log_safe, text)
 
     def _log_safe(self, text: str):
-        self.textbox.insert("end", f"  > {text}\n")
+        self.textbox.insert("end", f"   > {text}\n")
         self.textbox.see("end")
 
     def set_progress(self, value: float, label: str = ""):
@@ -189,7 +178,6 @@ class AudiobookApp(ctk.CTk):
             subprocess.Popen(["open", str(SOUNDS_DIR)])
         else:
             subprocess.Popen(["xdg-open", str(SOUNDS_DIR)])
-        # Recarregar DB após fechar o explorador (próxima ação)
         from cinema.sound_db import get_db
         db = get_db()
         db.reload()
@@ -213,14 +201,13 @@ class AudiobookApp(ctk.CTk):
             if compute_book_hash(current_text) != data["book_hash"]:
                 self.log("⚠️ AVISO: O conteúdo do livro mudou desde a análise!")
                 if not messagebox.askyesno("Conteúdo Alterado",
-                                           "O conteúdo do livro mudou.\n\nContinuar com a análise antiga?"):
+                                            "O conteúdo do livro mudou.\n\nContinuar com a análise antiga?"):
                     return
 
         self.characters = data.get("characters", {})
         self.segments   = sanitize_segments(data.get("segments", []))
         self.current_analysis_file = analysis_path
 
-        # Carregar eventos sonoros se existirem no JSON
         self.sound_events = data.get("sound_events", [])
 
         if self.file_path and not self.raw_text:
@@ -295,10 +282,8 @@ class AudiobookApp(ctk.CTk):
 
         mode = self._production_mode
 
-        # Modo Narrador: não precisa de análise de personagens
         if mode == "narrator":
             self.characters = {"narrator": DEFAULT_NARRATOR.copy()}
-            # Segmentos simples: cada parágrafo → narrador
             paragraphs = [p.strip() for p in self.raw_text.split('\n\n') if p.strip()]
             self.segments = [
                 {"text": p, "character_id": "narrator",
@@ -307,14 +292,13 @@ class AudiobookApp(ctk.CTk):
             ]
             self.log(f"✨ Modo Narrador: {len(self.segments)} parágrafos.")
         else:
-            # Novela / Cinema: análise completa com Ollama
             blocks = split_into_blocks(self.raw_text, max_chars=4000)
             self.log(f"📊 Texto dividido em {len(blocks)} blocos para análise.")
 
             all_characters, all_segments = {}, []
             for i, block in enumerate(blocks):
                 self.set_progress(0.1 + 0.7 * (i / len(blocks)),
-                                  f"Analisando bloco {i+1}/{len(blocks)}...")
+                                   f"Analisando bloco {i+1}/{len(blocks)}...")
                 self.log(f"🔍 Bloco {i+1}/{len(blocks)} ({len(block)} chars)...")
                 context = "\n".join(blocks[max(0, i-1):i])
                 result  = await analyze_block(
@@ -338,14 +322,13 @@ class AudiobookApp(ctk.CTk):
             self.characters, self.segments, self.model_name
         )
         if saved:
-            self.current_analysis_file = saved
+            self.current_analysis_file  = saved
             self.log(f"💾 Análise guardada: {Path(saved).name}")
 
         self.after(0, self._display_characters)
         self.after(0, lambda: self.btn_generate.configure(state="normal"))
         self.set_progress(1.0, "Análise concluída! Configura as vozes e clica em GERAR.")
 
-        # Modo Cinema: lançar análise de sons automaticamente após análise do livro
         if mode == "cinema":
             self.after(500, self.start_sound_analysis)
 
@@ -384,11 +367,10 @@ class AudiobookApp(ctk.CTk):
             progress_fn=self.set_progress
         )
 
-        total_sfx   = sum(len(e.get("sounds", [])) for e in self.sound_events)
+        total_sfx    = sum(len(e.get("sounds", [])) for e in self.sound_events)
         total_music = sum(1 for e in self.sound_events if e.get("music"))
         self.log(f"✅ Sons detetados: {total_sfx} efeitos, {total_music} momentos musicais.")
 
-        # Guardar eventos sonoros no JSON de análise
         if self.current_analysis_file:
             import json
             try:
@@ -410,7 +392,7 @@ class AudiobookApp(ctk.CTk):
     def _display_characters(self):
         mode = self._production_mode
         if mode == "narrator":
-            return   # sem painel de personagens no modo narrador
+            return
         from ui.character_panel import display_characters
         display_characters(self)
 
@@ -423,7 +405,7 @@ class AudiobookApp(ctk.CTk):
         display_sound_events(self, self.sound_events)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # FASE 3: GERAR AUDIOBOOK
+    # FASE 3: GERAR AUDIOBOOK (FLUXO OTIMIZADO COM CACHE INTELIGENTE)
     # ═══════════════════════════════════════════════════════════════════════════
     def start_generation(self):
         if not self.segments:
@@ -454,184 +436,156 @@ class AudiobookApp(ctk.CTk):
         mode = self._production_mode
         self.log(f"🎬 Modo: {mode.upper()}")
 
-        # ── Fase 0: Libertar VRAM do Ollama antes de carregar TTS ────────────
+        # ── Fase 0: Libertar VRAM do Ollama ─────────────────────────────────
         if OLLAMA_UNLOAD_AFTER_ANALYSIS:
-            unload_ollama(self.ollama_base_url,
-                          self.model_combobox.get(), self.log)
+            unload_ollama(self.ollama_base_url, self.model_combobox.get(), self.log)
             log_vram(self.log)
 
-        # ── Fase 1: Preparar personagens ─────────────────────────────────────
-        self.log("🧬 A preparar vozes...")
+        # ── FASE 1: MAPEAMENTO INTELIGENTE DE CACHE ─────────────────────────
+        self.log("🔍 A mapear segmentos em cache (verificação ultra-rápida)...")
+        cached_indices = set()
+        chars_with_uncached_segments = set()
+
+        for i, seg in enumerate(self.segments):
+            if isinstance(seg, dict):
+                # Usa a verificação ultra-rápida que acabámos de corrigir
+                if self.tts.is_segment_cached(i, seg.get("text", "")):
+                    cached_indices.add(i)
+                else:
+                    # Este segmento precisa de ser gerado. Quem é o personagem?
+                    # O teu JSON usa a chave "character_id"
+                    cid = seg.get("character_id", "narrator") if mode != "narrator" else "narrator"
+                    chars_with_uncached_segments.add(cid)
+
+        n_cached = len(cached_indices)
+        total = len(self.segments)
+        self.log(f"⚡ Cache: {n_cached}/{total} segmentos já prontos.")
+
+        if n_cached == total:
+            self.log("✅ Todos os segmentos em cache. A saltar para concatenação...")
+            await self._concatenate_and_finish(total, n_cached, [], [])
+            return
+
+        # ── FASE 2: PREPARAR APENAS AS VOZES NECESSÁRIAS ────────────────────
+        self.log(f"🧬 A preparar vozes APENAS para {len(chars_with_uncached_segments)} personagem(ns) que têm segmentos por gerar...")
+
+        chars_to_prepare = {}
         if mode == "narrator":
-            chars_to_prepare = {"narrator": self.characters.get(
-                "narrator", DEFAULT_NARRATOR.copy())}
+            chars_to_prepare = {"narrator": self.characters.get("narrator", DEFAULT_NARRATOR.copy())}
         else:
-            chars_to_prepare = self.characters
+            for cid in chars_with_uncached_segments:
+                if cid in self.characters:
+                    chars_to_prepare[cid] = self.characters[cid]
+                    # Atualizar descrição da UI se o utilizador a tiver editado
+                    if "_desc_entry" in self.characters.get(cid, {}):
+                        chars_to_prepare[cid]["description"] = self.characters[cid]["_desc_entry"].get()
 
-        # Ler descrições editadas na UI
-        for cid, cdata in chars_to_prepare.items():
-            if "_desc_entry" in self.characters.get(cid, {}):
-                cdata["description"] = self.characters[cid]["_desc_entry"].get()
-
-        # ── Fase 2: Gerar âncoras (precisam do VoiceDesign) ──────────────────
-        # Identificar quais os personagens sem ref_audio externo
-        need_design_for_anchors = any(
-            not c.get("ref_audio") for c in chars_to_prepare.values()
-        )
+        # ── FASE 3: GERAR ÂNCORAS (Agora sim, apenas para os filtrados) ─────
+        need_design_for_anchors = any(not c.get("ref_audio") for c in chars_to_prepare.values())
         if need_design_for_anchors:
             await self.tts.load_voicedesign()
 
         for cid, cdata in chars_to_prepare.items():
             await self.tts.ensure_anchor(cid, cdata)
 
-        # ── Fase 3: Decidir quais modelos carregar para síntese ───────────────
-        # Re-avaliar APÓS geração de âncoras: personagens com timeout ficam sem
-        # ref_audio e precisam de VoiceDesign em vez de Base.
+        # ── Fase 4: Decidir quais modelos carregar para síntese ─────────────
         needs_base = self.tts.needs_base(chars_to_prepare)
         needs_vd   = self.tts.needs_voicedesign(chars_to_prepare)
-
-        # Contar personagens que usarão fallback VoiceDesign (âncora falhou)
-        n_fallback = sum(
-            1 for c in chars_to_prepare.values()
-            if not c.get("ref_audio")
-        )
+        n_fallback = sum(1 for c in chars_to_prepare.values() if not c.get("ref_audio"))
+        
         if n_fallback:
-            needs_vd = True   # obrigatório para os fallbacks
-            self.log(f"   ⚠️ {n_fallback} personagem(ns) sem âncora → usarão VoiceDesign por segmento.")
+            needs_vd = True
+            self.log(f"   ⚠️ {n_fallback} personagem(ns) sem âncora → usarão VoiceDesign direto.")
 
-        self.log(f"📦 Modelos necessários: "
-                 f"{'Base(clone) ' if needs_base else ''}"
-                 f"{'VoiceDesign ' if needs_vd else ''}")
-
-        # Libertar VoiceDesign só se de todo não for necessário
+        self.log(f"📦 Modelos: {'Base(clone) ' if needs_base else ''}{'VoiceDesign' if needs_vd else ''}")
         if needs_base and not needs_vd:
             self.tts.release_voicedesign()
-
-        # ── Fase 4: Verificar cache existente ─────────────────────────────────
-        n_cached = self.tts.count_cached_segments(self.segments)
-        total    = len(self.segments)
-        if n_cached > 0:
-            self.log(f"⚡ Cache: {n_cached}/{total} segmentos já prontos — serão reutilizados.")
-
-        # ── Fase 5: Loop de geração ───────────────────────────────────────────
-        self.log(f"🎙️ A gerar {total - n_cached} segmento(s) "
-                 f"({n_cached} em cache)...")
-        audio_sequence = []
-        s_para = self.tts.create_silence(0.6, "s_para.wav")
-        failed_segments = []
-
-        # Carregar os modelos necessários uma única vez
-        if needs_base:
-            await self.tts.load_base()
-        if needs_vd:
-            await self.tts.load_voicedesign()
+        if needs_base: await self.tts.load_base()
+        if needs_vd:   await self.tts.load_voicedesign()
         log_vram(self.log)
+
+        # ── Fase 5: Loop de geração (salta os que estão em cache) ───────────
+        self.log(f"🎙️ A gerar {total - n_cached} segmento(s)...")
+        audio_sequence = []
+        failed_segments = []
+        s_para = self.tts.create_silence(0.6, "s_para.wav")
 
         for i, seg in enumerate(self.segments):
             self.set_progress(i / total, f"Segmento {i+1}/{total}")
+            if not isinstance(seg, dict): continue
 
-            if not isinstance(seg, dict):
+            # SALTO INTELIGENTE: Se está em cache, adiciona à sequência e continua
+            if i in cached_indices:
+                self.log(f"  ⏭️ [{i+1}] Em cache → saltado")
+                audio_sequence.append(str(self.tts.segment_cache_path(i)))
+                audio_sequence.append(str(s_para))
                 continue
-            text    = seg.get("text", "").strip()
+
+            text = seg.get("text", "").strip()
+            if not text: continue
+
             emotion = seg.get("emotion", "neutral")
-            pace    = float(seg.get("pace", 1.0)) * float(self.speed_slider.get())
-
-            if not text:
-                continue
-
-            if mode == "narrator":
-                seg_cid  = "narrator"
-                cdata    = self.characters.get("narrator", DEFAULT_NARRATOR.copy())
-            else:
-                seg_cid  = seg.get("character_id", "narrator")
-                cdata    = self.characters.get(
-                    seg_cid, self.characters.get("narrator", {}))
-
+            pace = float(seg.get("pace", 1.0)) * float(self.speed_slider.get())
+            seg_cid = seg.get("character_id", "narrator") if mode != "narrator" else "narrator"
+            cdata = self.characters.get(seg_cid, self.characters.get("narrator", {}))
             out_wav = self.tts.segment_cache_path(i)
 
-            # ── Cache hit ────────────────────────────────────────────────────
-            if self.tts.is_segment_cached(i, text):
-                self.log(f"  ⚡ [{i+1}/{total}] cache: {text[:40]}...")
-                final_wav = str(out_wav)
-            else:
-                # ── Síntese (com retry interno) ──────────────────────────────
-                name = cdata.get("name", "?")
-                self.log(f"  [{i+1}/{total}] {name} ({emotion}): {text[:40]}...")
+            name = cdata.get("name", "?")
+            self.log(f"  [{i+1}] {name} ({emotion}): {text[:40]}...")
 
-                # Trocar modelo se necessário (Base ↔ VoiceDesign)
-                use_clone = bool(cdata.get("ref_audio"))
-                if use_clone and self.tts.model_base is None:
-                    if needs_vd and self.tts.model_design is not None:
-                        self.log("   🔄 A trocar VoiceDesign → Base...")
-                        self.tts.release_voicedesign()
-                    await self.tts.load_base()
-                elif not use_clone and self.tts.model_design is None:
-                    if self.tts.model_base is not None:
-                        self.log("   🔄 A trocar Base → VoiceDesign...")
-                        self.tts.release_base()
-                    await self.tts.load_voicedesign()
+            use_clone = bool(cdata.get("ref_audio"))
+            if use_clone and self.tts.model_base is None:
+                await self.tts.load_base()
+            elif not use_clone and self.tts.model_design is None:
+                await self.tts.load_voicedesign()
 
-                success = await asyncio.to_thread(
-                    self.tts.clone_with_emotion,
-                    text, cdata.get("ref_audio"), emotion, pace, str(out_wav),
-                    cdata.get("ref_text", ""),
-                    cdata.get("description", "Voz neutra, português de Portugal.")
-                )
+            success = await asyncio.to_thread(
+                self.tts.clone_with_emotion,
+                text, cdata.get("ref_audio"), emotion, pace, str(out_wav),
+                cdata.get("ref_text", ""),
+                cdata.get("description", "Voz neutra, português de Portugal.")
+            )
 
-                if not success:
-                    self.log(f"   ❌ Segmento {i+1} falhou após {__import__('config.settings', fromlist=['TTS_MAX_RETRIES']).TTS_MAX_RETRIES} tentativas — ignorado.")
-                    failed_segments.append(i)
-                    continue
+            if not success:
+                self.log(f"   ❌ Segmento {i+1} falhou → ignorado.")
+                failed_segments.append(i)
+                continue
 
-                final_wav = str(out_wav)
-
-            # ── Modo Cinema: mixagem ─────────────────────────────────────────
+            final_wav = str(out_wav)
             if mode == "cinema":
-                sound_data = (self.sound_events[i]
-                              if i < len(self.sound_events)
-                              else {"sounds": [], "music": None})
+                sound_data = (self.sound_events[i] if i < len(self.sound_events) else {"sounds": [], "music": None})
                 sound_data = _read_sound_panel_values(sound_data)
-
                 if sound_data.get("sounds") or sound_data.get("music"):
                     from cinema.mixer import apply_cinema_mix
-                    self.log(f"   🎬 Mixando sons{' + 🎵' if sound_data.get('music') else ''}...")
-                    final_wav = await asyncio.to_thread(
-                        apply_cinema_mix, final_wav, sound_data,
-                        self.temp_dir, i, self.log
-                    )
+                    final_wav = await asyncio.to_thread(apply_cinema_mix, final_wav, sound_data, self.temp_dir, i, self.log)
 
             audio_sequence.append(final_wav)
             audio_sequence.append(str(s_para))
 
-        # ── Fase 6: Libertar VRAM TTS antes de montar o M4B ─────────────────
+        # ── Fase 6: Libertar VRAM TTS e Finalizar ───────────────────────────
         self.tts.release_base()
         self.tts.release_voicedesign()
         log_vram(self.log)
+        await self._concatenate_and_finish(total, n_cached, failed_segments, audio_sequence)
 
-        # ── Relatório final ───────────────────────────────────────────────────
-        generated = total - n_cached - len(failed_segments)
-        self.log(f"📊 Gerados: {generated}  Cache: {n_cached}  "
-                 f"Falhas: {len(failed_segments)}  Total: {total}")
-        if failed_segments:
-            self.log(f"   ⚠️ Segmentos ignorados: {failed_segments[:10]}"
-                     f"{'...' if len(failed_segments) > 10 else ''}")
+    async def _concatenate_and_finish(self, total: int, n_cached: int, failed: list, audio_seq: list):
+        generated = total - n_cached - len(failed)
+        self.log(f"📊 Gerados: {generated} | Cache: {n_cached} | Falhas: {len(failed)} | Total: {total}")
+        if failed:
+            self.log(f"   ⚠️ Ignorados: {failed[:10]}{'...' if len(failed)>10 else ''}")
 
-        if audio_sequence:
+        if audio_seq:
             title  = self.entry_title.get() or "Audiobook"
             author = self.entry_author.get() or "IA"
-            ok = create_m4b(audio_sequence, title, author,
-                            self.cover_path, log_fn=self.log)
+            ok = await asyncio.to_thread(create_m4b, audio_seq, title, author, self.cover_path, self.log)
             if ok:
-                self.after(0, lambda: messagebox.showinfo(
-                    "Sucesso", f"Audiobook criado:\n{title}.m4b"))
-
+                self.after(0, lambda: messagebox.showinfo("Sucesso", f"Audiobook criado:\n{title}.m4b"))
 
 
 # ─── Utilitário: lê valores editados pelo utilizador no painel de sons ────────
 def _read_sound_panel_values(sound_data: dict) -> dict:
     """Substitui os valores dos eventos sonoros pelos das widgets (se editados)."""
     result = {"sounds": [], "music": sound_data.get("music")}
-
     for ev in sound_data.get("sounds", []):
         new_ev = dict(ev)
         if "_name_var" in ev:

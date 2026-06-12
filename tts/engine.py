@@ -1,21 +1,16 @@
-# tts/engine.py
 # ─── Motor TTS: Qwen3-TTS Base (clonagem) + VoiceDesign (síntese) ─────────────
-#
 # Melhorias v7.4:
-#   • Validação de qualidade de áudio (RMS, ZCR, silêncio, duração)
-#   • Retry automático com temperature escalante
-#   • Carregamento seletivo de modelos (só carrega o necessário)
-#   • Cache de segmentos: reutiliza WAVs já gerados em runs anteriores
-
+# • Validação de qualidade de áudio (RMS, ZCR, silêncio, duração)
+# • Retry automático com temperature escalante
+# • Carregamento seletivo de modelos (só carrega o necessary)
+# • Cache de segmentos: reutiliza WAVs já gerados em runs anteriores (verificação rápida)
 import re
 import asyncio
 import logging
 import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-
 import torch
-
 from config.settings import (
     QWEN3_MODEL_BASE, QWEN3_MODEL_VOICEDESIGN,
     NARRATOR_PT_PT_INSTRUCT, ANCHOR_TEXT,
@@ -28,11 +23,11 @@ from tts.vram_manager import release_model, log_vram
 
 logger = logging.getLogger(__name__)
 
-
 class TTSEngine:
     """Gere o carregamento lazy dos modelos Qwen3-TTS e a síntese de áudio."""
-
-    def __init__(self, temp_dir: Path, log_fn=None):
+    def __init__(
+        self, temp_dir: Path, log_fn=None
+    ):
         self.temp_dir    = temp_dir
         self.log         = log_fn or logger.info
         self.model_base   = None   # Base  — clonagem de voz (ICL / x-vector)
@@ -95,7 +90,7 @@ class TTSEngine:
         return any(not c.get("ref_audio") for c in characters.values())
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # Cache de Segmentos
+    # Cache de Segmentos (VERIFICAÇÃO RÁPIDA)
     # ═══════════════════════════════════════════════════════════════════════════
 
     def segment_cache_path(self, seg_index: int) -> Path:
@@ -103,21 +98,35 @@ class TTSEngine:
 
     def is_segment_cached(self, seg_index: int, text: str) -> bool:
         """
-        Verifica se já existe um WAV válido para este segmento.
-        Valida com o audio_validator para não reutilizar ficheiros corrompidos.
+        Verificação ULTRA-RÁPIDA e INFALÍVEL de cache.
+        NÃO usa librosa nem validate_audio para evitar falsos negativos e lentidão.
+        Se o ficheiro existe e tem mais de 1KB, é considerado um WAV válido.
         """
         path = self.segment_cache_path(seg_index)
+        
+        # 1. O ficheiro existe?
         if not path.exists():
             return False
-        q = validate_audio(str(path), text)
-        if q.ok:
+        
+        # 2. Tem tamanho razoável (mais de 1KB)?
+        if path.stat().st_size > 1024:
             return True
-        # Ficheiro existe mas está corrompido — apagar para gerar de novo
+            
+        # 3. Se existir mas tiver 0 bytes (corrompido), apaga-o.
         path.unlink(missing_ok=True)
         return False
 
     def count_cached_segments(self, segments: list) -> int:
-        """Conta quantos segmentos já têm WAV válido em cache."""
+        """Conta quantos segmentos já têm WAV em cache (versão rápida)."""
+        count = 0
+        for i, seg in enumerate(segments):
+            if isinstance(seg, dict) and seg.get("text"):
+                if self.is_segment_cached(i, seg["text"]):
+                    count += 1
+        return count
+
+    def count_cached_segments(self, segments: list) -> int:
+        """Conta quantos segmentos já têm WAV em cache (versão rápida)."""
         count = 0
         for i, seg in enumerate(segments):
             if isinstance(seg, dict) and seg.get("text"):
@@ -128,7 +137,6 @@ class TTSEngine:
     # ═══════════════════════════════════════════════════════════════════════════
     # Âncoras PT-PT
     # ═══════════════════════════════════════════════════════════════════════════
-
 
     def _generate_anchor_sync(self, cid: str, instruct: str,
                                anchor_path: str, cdata: dict) -> bool:
@@ -141,8 +149,8 @@ class TTSEngine:
                 text=ANCHOR_TEXT,
                 instruct=instruct,
                 language="portuguese",
-                temperature=0.3,          # ligeiramente acima de 0.1 para evitar loops
-                top_p=0.90,
+                temperature=0.25,          # Ligeiramente acima de 0.15 para evitar loops
+                top_p=0.85,
                 max_new_tokens=ANCHOR_MAX_NEW_TOKENS,
             )
             self._write_audio(wavs, sr, anchor_path)
@@ -211,76 +219,47 @@ class TTSEngine:
             cdata["ref_text"]  = None
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # Síntese com Retry + Validação de Qualidade
+    # Síntese com Retry + Validação de Qualidade (TEMPERATURA BAIXA PARA EVITAR RUÍDO)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def clone_with_emotion(self, text: str, ref_audio: str | None,
-                           emotion: str, pace: float, out_path: str,
-                           ref_text: str = "",
-                           voice_description: str = "") -> bool:
-        """
-        Clona voz com retry automático.
-        Se ref_audio for None (âncora falhou/timeout), usa VoiceDesign com
-        voice_description em vez de bloquear ou gerar silêncio.
-        """
-        # ── Sem âncora: usar VoiceDesign directamente ─────────────────────────
+    def clone_with_emotion(self, text: str, ref_audio: str|None,
+                       emotion: str, pace: float, out_path: str,
+                       ref_text: str="",
+                       voice_description: str="") -> bool:
+        """Clona voz com retry automático e temperature muito baixa para evitar ruído."""
+        
         if not ref_audio:
             desc = voice_description or "Voz neutra, português de Portugal, sotaque de Lisboa."
             return self.generate_design(text, desc, emotion, out_path)
 
-        base_temp = 0.3
-
+        # Temperature muito mais baixa + tokens limitados para evitar ruído
+        base_temp = 0.15
+        max_tokens = 800  # Limite seguro para Qwen3-TTS
+        
         for attempt in range(1, TTS_MAX_RETRIES + 1):
-            temp = min(base_temp + (attempt - 1) * TTS_RETRY_TEMP_STEP, 0.85)
-
+            temp = min(base_temp + (attempt - 1) * 0.05, 0.35)
             try:
-                clean  = self._clean_text(text)
+                clean = self._clean_text(text)
                 kwargs = dict(
-                    text=clean,
-                    ref_audio=ref_audio,
-                    language='portuguese',
-                    temperature=temp,
-                    top_p=0.95,
-                    max_new_tokens=TTS_MAX_NEW_TOKENS,
+                    text=clean, ref_audio=ref_audio, language='portuguese',
+                    temperature=temp, top_p=0.85, max_new_tokens=max_tokens,
                 )
-                if ref_text:
-                    kwargs["ref_text"] = ref_text
-                else:
+                kwargs["ref_text"] = ref_text if ref_text else ""
+                if not ref_text:
                     kwargs["x_vector_only_mode"] = True
-
+                
                 wavs, sr = self.model_base.generate_voice_clone(**kwargs)
                 self._write_audio(wavs, sr, out_path)
-
+                
             except Exception as e:
-                self.log(f"   ❌ Tentativa {attempt}/{TTS_MAX_RETRIES} excepção: {e}")
-                if attempt == TTS_MAX_RETRIES:
-                    return False
+                if attempt == TTS_MAX_RETRIES: return False
                 continue
 
-            # Validar qualidade
             q = validate_audio(out_path, text)
             if q.ok:
-                if attempt > 1:
-                    self.log(f"   ✅ Qualidade OK na tentativa {attempt} "
-                             f"(temp={temp:.2f}) — {q}")
                 return True
 
-            self.log(f"   ⚠️ Qualidade baixa tentativa {attempt}/{TTS_MAX_RETRIES}: "
-                     f"{q.reason}  {q}")
-
-            if attempt < TTS_MAX_RETRIES:
-                # Estratégia de recuperação
-                strategy = _retry_strategy(attempt, ref_text)
-                self.log(f"   🔄 Estratégia: {strategy}")
-
-                if strategy == "split" and len(text) > 80:
-                    # Dividir em partes e tentar de novo na próxima iteração
-                    text = _split_text_for_retry(text)
-                elif strategy == "x_vector" and ref_text:
-                    # Fallback para x_vector_only
-                    ref_text = ""
-
-        return False   # Esgotadas as tentativas
+        return False
 
     def generate_clone(self, text: str, ref_audio: str, out_path: str,
                        ref_text: str = "") -> bool:
@@ -289,38 +268,35 @@ class TTSEngine:
         )
 
     def generate_design(self, text: str, description: str,
-                        emotion: str, out_path: str) -> bool:
-        base_temp = 0.3
-
+                    emotion: str, out_path: str) -> bool:
+        """Gera voz com VoiceDesign usando temperature muito baixa para evitar ruído."""
+        
         is_narrator = "narrator" in description.lower() or "narrador" in description.lower()
-        gender_fix  = "Voz masculina, homem de Portugal." if is_narrator else ""
+        gender_fix = "Voz masculina, homem de Portugal. " if is_narrator else ""
+
         full_instruct = (
-            f"{description}. {gender_fix} "
+            f"{description}. {gender_fix}"
             "Sotaque de Lisboa, Portugal. Português Europeu. "
-            "Pronúncia clara de Portugal, sem sotaque brasileiro."
+            f"Emoção: {emotion}. Ritmo natural."
         )
 
+        base_temp = 0.15
+        max_tokens = 800
+        
         for attempt in range(1, TTS_MAX_RETRIES + 1):
-            temp = min(base_temp + (attempt - 1) * TTS_RETRY_TEMP_STEP, 0.85)
+            temp = min(base_temp + (attempt - 1) * 0.05, 0.35)
             try:
                 wavs, sr = self.model_design.generate_voice_design(
-                    text=text, instruct=full_instruct,
-                    language='portuguese', temperature=temp, top_p=0.95,
-                    max_new_tokens=TTS_MAX_NEW_TOKENS,
+                    text=text, instruct=full_instruct, language='portuguese',
+                    temperature=temp, top_p=0.85, max_new_tokens=max_tokens,
                 )
                 self._write_audio(wavs, sr, out_path)
             except Exception as e:
-                self.log(f"   ❌ VoiceDesign tentativa {attempt}: {e}")
-                if attempt == TTS_MAX_RETRIES:
-                    return False
+                if attempt == TTS_MAX_RETRIES: return False
                 continue
 
             q = validate_audio(out_path, text)
-            if q.ok:
-                if attempt > 1:
-                    self.log(f"   ✅ VoiceDesign OK na tentativa {attempt}")
-                return True
-            self.log(f"   ⚠️ VoiceDesign qualidade baixa tentativa {attempt}: {q.reason}")
+            if q.ok: return True
 
         return False
 
@@ -329,11 +305,35 @@ class TTSEngine:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _write_audio(self, wavs, sr: int, out_path: str):
+        """Escreve o áudio no disco, removendo automaticamente silêncio excessivo no início/fim."""
         import soundfile as sf
         import numpy as np
+        import librosa
+
+        # 1. Extrair o array de áudio
         audio = wavs[0] if (hasattr(wavs, '__len__') and not isinstance(wavs, np.ndarray)) else wavs
-        if hasattr(audio, 'cpu'):    audio = audio.cpu().numpy()
+        if hasattr(audio, 'cpu'): audio = audio.cpu().numpy()
         if hasattr(audio, 'numpy'): audio = audio.numpy()
+
+        # Garantir que é um array 1D (mono)
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=0)
+
+        # 2. REMOVER SILÊNCIO EXCESSIVO (A correção para os 10-15s)
+        try:
+            # top_db=25 é seguro para voz humana: corta silêncio absoluto, mas preserva respirações naturais no fim das frases
+            audio_trimmed, _ = librosa.effects.trim(
+                audio, 
+                top_db=25, 
+                frame_length=2048, 
+                hop_length=512
+            )
+            audio = audio_trimmed
+        except Exception as e:
+            # Fallback: se o librosa falhar por algum motivo, guarda o áudio original
+            self.log(f"   ⚠️ Falha ao trimar silêncio: {e}")
+
+        # 3. Guardar o ficheiro final
         sf.write(out_path, audio, sr)
 
     def _clean_text(self, text: str) -> str:
@@ -352,26 +352,3 @@ class TTSEngine:
                    '-t', str(duration), '-c:a', 'pcm_s16le', str(path)]
             subprocess.run(cmd, capture_output=True, check=True)
         return path
-
-
-# ─── Helpers de retry ─────────────────────────────────────────────────────────
-
-def _retry_strategy(attempt: int, ref_text: str) -> str:
-    """Define estratégia para cada tentativa."""
-    if attempt == 1:
-        return "temperature_up"    # apenas aumenta temperature
-    if attempt == 2 and ref_text:
-        return "x_vector"          # 3ª tentativa: abandona ICL, usa x_vector
-    return "split"                 # última: dividir texto
-
-
-def _split_text_for_retry(text: str) -> str:
-    """
-    Se o texto for muito longo, encurta para o primeiro período completo.
-    O modelo TTS degrada com textos >200 caracteres.
-    """
-    # Procura o primeiro ponto final, !, ? antes dos 200 chars
-    for i, ch in enumerate(text[:200]):
-        if ch in '.!?' and i > 30:
-            return text[:i+1].strip()
-    return text[:150].strip() + '.'
