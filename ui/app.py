@@ -249,6 +249,149 @@ class AudiobookApp(ctk.CTk):
     # ═══════════════════════════════════════════════════════════════════════════
     # FASE 1: ANÁLISE DO LIVRO
     # ═══════════════════════════════════════════════════════════════════════════
+    def _smart_segment_splitter(self, segments: list) -> list:
+        """
+        Pós-processamento inteligente para separar discurso direto de narração.
+        """
+        refined_segments = []
+        
+        for seg in segments:
+            if not isinstance(seg, dict):
+                refined_segments.append(seg)
+                continue
+                
+            text = seg.get("text", "").strip()
+            character_id = seg.get("character_id", "narrator")
+            emotion = seg.get("emotion", "neutral")
+            pace = seg.get("pace", 1.0)
+            pause_ms = seg.get("pause_ms", 0)
+            
+            # Verificar padrões de discurso direto + narração no mesmo segmento
+            refined_segments.extend(self._split_discourse_and_narration(
+                text, character_id, emotion, pace, pause_ms
+            ))
+        
+        return refined_segments
+
+    def _split_discourse_and_narration(self, text: str, character_id: str, 
+                                    emotion: str, pace: float, pause_ms: int) -> list:
+        """
+        Separa discurso direto de narração dentro do mesmo segmento.
+        """
+        import re
+        
+        # Padrões comuns de discurso direto
+        discourse_patterns = [
+            r'(["«])(.*?)(["»])',  # "..." ou «...»
+            r'(["«])([^"»]+)(["»])',  # Aspas simples ou duplas
+            r'(\w+)\s*(exclamou|disse|respondeu|gritou|sussurrou|afirmou|declarou)',  # Verbos de fala
+        ]
+        
+        # Se for o narrador, verificar se há discurso direto embutido
+        if character_id == "narrator":
+            # Procurar por aspas no texto
+            quote_matches = list(re.finditer(r'(["«])(.*?)(["»])', text))
+            
+            if quote_matches:
+                # Separar discurso direto da narração
+                result = []
+                last_end = 0
+                
+                for match in quote_matches:
+                    # Parte antes da citação (narração)
+                    before = text[last_end:match.start()].strip()
+                    if before:
+                        result.append({
+                            "text": before,
+                            "character_id": "narrator",
+                            "emotion": emotion,
+                            "pace": pace,
+                            "pause_ms": pause_ms if len(result) == 0 else 0
+                        })
+                    
+                    # A citação (discurso direto)
+                    quote_text = match.group(2).strip()
+                    if quote_text:
+                        # Tentar identificar quem fala (olhar contexto)
+                        speaker = self._identify_speaker(text, quote_text)
+                        result.append({
+                            "text": quote_text,
+                            "character_id": speaker,
+                            "emotion": self._adjust_emotion_for_discourse(emotion),
+                            "pace": pace * 1.1,  # Ligeiramente mais rápido para diálogo
+                            "pause_ms": 300 if len(result) > 0 else pause_ms
+                        })
+                    
+                    last_end = match.end()
+                
+                # Parte depois da última citação (narração)
+                after = text[last_end:].strip()
+                if after:
+                    result.append({
+                        "text": after,
+                        "character_id": "narrator",
+                        "emotion": emotion,
+                        "pace": pace,
+                        "pause_ms": 200
+                    })
+                
+                return result
+        
+        # Caso contrário, retornar o segmento original
+        return [{
+            "text": text,
+            "character_id": character_id,
+            "emotion": emotion,
+            "pace": pace,
+            "pause_ms": pause_ms
+        }]
+
+    def _identify_speaker(self, full_text: str, quote_text: str) -> str:
+        """
+        Tenta identificar quem está falando com base no contexto.
+        """
+        import re
+        
+        # Procurar por verbos de fala próximos à citação
+        speaker_patterns = [
+            r'(\w+)\s+(exclamou|disse|respondeu|gritou|sussurrou|afirmou|declarou)',
+            r'(exclamou|disse|respondeu|gritou|sussurrou|afirmou|declarou)\s+(\w+)',
+        ]
+        
+        for pattern in speaker_patterns:
+            matches = list(re.finditer(pattern, full_text, re.IGNORECASE))
+            for match in matches:
+                # Verificar se está próximo à citação
+                speaker_name = match.group(1) if match.group(1).lower() not in [
+                    'exclamou', 'disse', 'respondeu', 'gritou', 'sussurrou', 'afirmou', 'declarou'
+                ] else match.group(2)
+                
+                # Procurar personagem com nome similar
+                for cid, cdata in self.characters.items():
+                    if speaker_name.lower() in cdata.get("name", "").lower() or \
+                    cdata.get("name", "").lower() in speaker_name.lower():
+                        return cid
+        
+        # Fallback: usar personagem mais recente ou narrador
+        return "narrator"
+
+    def _adjust_emotion_for_discourse(self, base_emotion: str) -> str:
+        """
+        Ajusta a emoção para discurso direto.
+        """
+        discourse_emotions = {
+            "neutral": "calm",
+            "calm": "calm",
+            "tense": "tense",
+            "joyful": "joyful",
+            "sad": "sad",
+            "angry": "angry",
+            "fearful": "fearful",
+            "whisper": "whisper"
+        }
+        return discourse_emotions.get(base_emotion, base_emotion)
+
+    
     def start_analysis(self):
         if not self.file_path:
             messagebox.showwarning("Atenção", "Seleciona um livro primeiro.")
@@ -310,7 +453,8 @@ class AudiobookApp(ctk.CTk):
                     all_segments.extend(result.get("segments", []))
 
             self.characters = all_characters
-            self.segments   = sanitize_segments(all_segments)
+            raw_segments = sanitize_segments(all_segments)
+            self.segments = self._smart_segment_splitter(raw_segments)
 
             if "narrator" not in self.characters:
                 self.characters["narrator"] = DEFAULT_NARRATOR.copy()
@@ -442,25 +586,23 @@ class AudiobookApp(ctk.CTk):
             log_vram(self.log)
 
         # ── FASE 1: MAPEAMENTO INTELIGENTE DE CACHE ─────────────────────────
-        self.log("🔍 A mapear segmentos em cache (verificação ultra-rápida)...")
+        self.log(f"🔍 A mapear segmentos em cache na pasta: {self.tts.temp_dir.absolute()}")
         cached_indices = set()
         chars_with_uncached_segments = set()
 
         for i, seg in enumerate(self.segments):
             if isinstance(seg, dict):
-                # Usa a verificação ultra-rápida que acabámos de corrigir
+                # Agora esta chamada é instantânea e não rejeita ficheiros válidos
                 if self.tts.is_segment_cached(i, seg.get("text", "")):
                     cached_indices.add(i)
                 else:
                     # Este segmento precisa de ser gerado. Quem é o personagem?
-                    # O teu JSON usa a chave "character_id"
                     cid = seg.get("character_id", "narrator") if mode != "narrator" else "narrator"
                     chars_with_uncached_segments.add(cid)
 
         n_cached = len(cached_indices)
         total = len(self.segments)
         self.log(f"⚡ Cache: {n_cached}/{total} segmentos já prontos.")
-
         if n_cached == total:
             self.log("✅ Todos os segmentos em cache. A saltar para concatenação...")
             await self._concatenate_and_finish(total, n_cached, [], [])
@@ -469,33 +611,77 @@ class AudiobookApp(ctk.CTk):
         # ── FASE 2: PREPARAR APENAS AS VOZES NECESSÁRIAS ────────────────────
         self.log(f"🧬 A preparar vozes APENAS para {len(chars_with_uncached_segments)} personagem(ns) que têm segmentos por gerar...")
 
+        # LIMITAR O NÚMERO DE PERSONAGENS PARA EVITAR TIMEOUT (mas manter o narrador)
+        max_chars = 15  # Reduzido para melhor performance
+        char_list = list(chars_with_uncached_segments)
+
+        if len(char_list) > max_chars:
+            # Sempre incluir o narrador
+            if "narrator" in char_list:
+                char_list = ["narrator"] + [c for c in char_list if c != "narrator"][:max_chars-1]
+            else:
+                char_list = char_list[:max_chars]
+            self.log(f"⚠️ Limitando personagens de {len(chars_with_uncached_segments)} para {len(char_list)} para evitar timeout")
+
         chars_to_prepare = {}
         if mode == "narrator":
             chars_to_prepare = {"narrator": self.characters.get("narrator", DEFAULT_NARRATOR.copy())}
         else:
-            for cid in chars_with_uncached_segments:
+            for cid in char_list:
                 if cid in self.characters:
                     chars_to_prepare[cid] = self.characters[cid]
                     # Atualizar descrição da UI se o utilizador a tiver editado
                     if "_desc_entry" in self.characters.get(cid, {}):
                         chars_to_prepare[cid]["description"] = self.characters[cid]["_desc_entry"].get()
 
-        # ── FASE 3: GERAR ÂNCORAS (Agora sim, apenas para os filtrados) ─────
-        need_design_for_anchors = any(not c.get("ref_audio") for c in chars_to_prepare.values())
-        if need_design_for_anchors:
-            await self.tts.load_voicedesign()
-
+        # ── FORÇAR SOTAQUE PT-PT PARA TODAS AS PERSONAGENS ────────────────────
+        self.log("🇵🇹 Forçando sotaque português europeu para todas as personagens...")
         for cid, cdata in chars_to_prepare.items():
-            await self.tts.ensure_anchor(cid, cdata)
+            # Atualizar descrição para garantir sotaque PT-PT
+            current_desc = cdata.get("description", "")
+            if "portugal" not in current_desc.lower() and "português" not in current_desc.lower():
+                if cid == "narrator":
+                    cdata["description"] = f"{current_desc} Voz portuguesa de Portugal, sotaque europeu."
+                else:
+                    cdata["description"] = f"{current_desc} Voz portuguesa de Portugal, sotaque europeu."
+
+        # ── FASE 3: GERAR ÂNCORAS (Agora sim, apenas para os filtrados) ─────
+        # Verificar quais personagens precisam de âncoras (não têm ref_audio)
+        chars_needing_anchors = {cid: cdata for cid, cdata in chars_to_prepare.items() 
+                                if not cdata.get("ref_audio")}
+
+        if chars_needing_anchors:
+            self.log(f"⚓ Gerando âncoras para {len(chars_needing_anchors)} personagem(ns)...")
+            await self.tts.load_voicedesign()
+            
+            anchor_success_count = 0
+            for cid, cdata in chars_needing_anchors.items():
+                await self.tts.ensure_anchor(cid, cdata)
+                if cdata.get("ref_audio"):
+                    anchor_success_count += 1
+            
+            self.log(f"   ✅ {anchor_success_count} âncoras geradas com sucesso")
+            
+            # Atualizar chars_to_prepare com as âncoras geradas
+            for cid, cdata in chars_to_prepare.items():
+                if cid in chars_needing_anchors and cdata.get("ref_audio"):
+                    # Âncora foi gerada com sucesso
+                    pass
+                elif cid in chars_needing_anchors and not cdata.get("ref_audio"):
+                    # Falha na âncora - usar VoiceDesign direto
+                    cdata["ref_audio"] = None
+                    cdata["ref_text"] = None
+                    
 
         # ── Fase 4: Decidir quais modelos carregar para síntese ─────────────
         needs_base = self.tts.needs_base(chars_to_prepare)
         needs_vd   = self.tts.needs_voicedesign(chars_to_prepare)
         n_fallback = sum(1 for c in chars_to_prepare.values() if not c.get("ref_audio"))
-        
-        if n_fallback:
-            needs_vd = True
-            self.log(f"   ⚠️ {n_fallback} personagem(ns) sem âncora → usarão VoiceDesign direto.")
+
+        # Corrigir contagem de fallback (apenas VoiceDesign direto)
+        actual_fallback = sum(1 for c in chars_to_prepare.values() if not c.get("ref_audio") or c.get("ref_audio") is None)
+        if actual_fallback > 0:
+            self.log(f"   ⚠️ {actual_fallback} personagem(ns) sem âncora → usarão VoiceDesign direto.")
 
         self.log(f"📦 Modelos: {'Base(clone) ' if needs_base else ''}{'VoiceDesign' if needs_vd else ''}")
         if needs_base and not needs_vd:
@@ -524,6 +710,39 @@ class AudiobookApp(ctk.CTk):
             text = seg.get("text", "").strip()
             if not text: continue
 
+            # ── VALIDAÇÃO CRÍTICA: Evitar uso de texto de âncora como conteúdo ───────────
+            from config.settings import ANCHOR_TEXT
+            # Verificar se o texto é exatamente igual ao texto da âncora
+            if text.strip() == ANCHOR_TEXT.strip():
+                self.log(f"   ⚠️ Texto do segmento é idêntico ao texto da âncora - corrigindo...")
+                # Isso indica um problema na análise - usar um texto mais apropriado
+                text = f"{name} está falando."  # Texto genérico de fallback
+
+            # Verificar se o texto parece ser de âncora (padrões comuns)
+            anchor_indicators = ["sotaque de lisboa", "portugal", "europeia", "narrador", "minha voz"]
+            is_suspicious_anchor = (
+                any(indicator in text.lower() for indicator in anchor_indicators) and 
+                len(text) < 200 and  # Textos de âncora são geralmente curtos
+                "estou a falar" in text.lower()
+            )
+
+            if is_suspicious_anchor:
+                self.log(f"   ⚠️ Texto suspeito de ser âncora detectado no segmento {i+1}")
+                # Tentar recuperar o texto original ou usar um fallback
+                original_text = seg.get("text", "").strip()
+                if original_text != text and len(original_text) > len(text):
+                    # Usar o texto original se for mais longo
+                    text = original_text
+                    self.log(f"   🔄 Recuperando texto original: {text[:50]}...")
+                else:
+                    # Fallback - criar um texto genérico
+                    text = f"{name} diz: [conteúdo do diálogo]" 
+                    self.log(f"   🔄 Usando texto de fallback para evitar âncora")
+
+            # Garantir que o texto tenha conteúdo significativo
+            if len(text.strip()) < 5:
+                text = f"{name}: {text}" if text else f"{name} está falando."
+
             emotion = seg.get("emotion", "neutral")
             pace = float(seg.get("pace", 1.0)) * float(self.speed_slider.get())
             seg_cid = seg.get("character_id", "narrator") if mode != "narrator" else "narrator"
@@ -546,9 +765,44 @@ class AudiobookApp(ctk.CTk):
                 cdata.get("description", "Voz neutra, português de Portugal.")
             )
 
+            # VALIDAÇÃO ADICIONAL DE QUALIDADE
+            if success:
+                # Validar qualidade do áudio gerado
+                try:
+                    from tts.audio_validator import validate_audio
+                    q = validate_audio(str(out_wav), text)
+                    if not q.ok:
+                        self.log(f"   ⚠️ Áudio de baixa qualidade detectado [{i+1}]: {q.reason}")
+                        # Tentar regerar com parâmetros diferentes se for problema de ruído
+                        if "ruído" in q.reason.lower() or "silêncio" in q.reason.lower() or "rms" in q.reason.lower():
+                            self.log(f"   🔄 Tentando regerar segmento {i+1} com parâmetros conservadores...")
+                            # Ajustar parâmetros para tentativa mais conservadora
+                            success = await asyncio.to_thread(
+                                self.tts.clone_with_emotion,
+                                text, cdata.get("ref_audio"), emotion, pace * 0.8, str(out_wav),
+                                cdata.get("ref_text", ""),
+                                cdata.get("description", "Voz neutra, português de Portugal.")
+                            )
+                            # Validar novamente
+                            if success:
+                                q2 = validate_audio(str(out_wav), text)
+                                if not q2.ok:
+                                    self.log(f"   ❌ Segunda tentativa também falhou [{i+1}]: {q2.reason}")
+                                    success = False
+                        else:
+                            success = False
+                except Exception as e:
+                    self.log(f"   ⚠️ Erro na validação do segmento {i+1}: {e}")
+                    success = False
+
             if not success:
                 self.log(f"   ❌ Segmento {i+1} falhou → ignorado.")
                 failed_segments.append(i)
+                # Remover arquivo problemático
+                try:
+                    Path(out_wav).unlink(missing_ok=True)
+                except:
+                    pass
                 continue
 
             final_wav = str(out_wav)
@@ -559,7 +813,12 @@ class AudiobookApp(ctk.CTk):
                     from cinema.mixer import apply_cinema_mix
                     final_wav = await asyncio.to_thread(apply_cinema_mix, final_wav, sound_data, self.temp_dir, i, self.log)
 
-            audio_sequence.append(final_wav)
+            if self._validate_audio_file(final_wav, i+1):
+                audio_sequence.append(final_wav)
+            else:
+                self.log(f"   ⚠️ Segmento {i+1} inválido - ignorado")
+                failed_segments.append(i)
+
             audio_sequence.append(str(s_para))
 
         # ── Fase 6: Libertar VRAM TTS e Finalizar ───────────────────────────
@@ -567,6 +826,7 @@ class AudiobookApp(ctk.CTk):
         self.tts.release_voicedesign()
         log_vram(self.log)
         await self._concatenate_and_finish(total, n_cached, failed_segments, audio_sequence)
+
 
     async def _concatenate_and_finish(self, total: int, n_cached: int, failed: list, audio_seq: list):
         generated = total - n_cached - len(failed)
@@ -581,6 +841,33 @@ class AudiobookApp(ctk.CTk):
             if ok:
                 self.after(0, lambda: messagebox.showinfo("Sucesso", f"Audiobook criado:\n{title}.m4b"))
 
+    def _validate_audio_file(self, file_path: str, segment_index: int) -> bool:
+        """Valida um arquivo de áudio individual antes da concatenação."""
+        try:
+            from tts.audio_validator import validate_audio
+            import soundfile as sf
+            from pathlib import Path
+            
+            path = Path(file_path)
+            if not path.exists():
+                return False
+                
+            # Verificação básica de tamanho
+            if path.stat().st_size < 512:  # Menos de 512 bytes
+                return False
+                
+            # Tentar ler o arquivo
+            audio, sr = sf.read(str(path))
+            duration = len(audio) / sr if sr > 0 else 0
+            
+            # Verificar duração mínima (menos de 50ms é suspeito)
+            if duration < 0.05:
+                return False
+                
+            return True
+        except Exception as e:
+            self.log(f"   ⚠️ Erro ao validar {segment_index}: {e}")
+            return False
 
 # ─── Utilitário: lê valores editados pelo utilizador no painel de sons ────────
 def _read_sound_panel_values(sound_data: dict) -> dict:

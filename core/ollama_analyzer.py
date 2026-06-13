@@ -93,14 +93,21 @@ async def analyze_block(ollama_url: str, model_name: str,
    - pace: 0.8 a 1.2 (ritmo)
    - pause_ms: 0 a 1500 (pausa antes deste segmento)
 
+REGRAS IMPORTANTES DE SEGMENTAÇÃO:
+- DISCURSO DIRETO ("..." ou «...»): atribuir ao personagem que fala
+- NARRAÇÃO: atribuir ao narrador
+- AÇÕES ENTRE DIÁLOGOS: atribuir ao narrador
+- EXCLAMAÇÕES com "exclamou", "disse", "respondeu": separar discurso da narração
+- CADA PERSONAGEM TEM APENAS UMA VEZ A FALA NO MESMO SEGMENTO
+
+EXEMPLO CORRETO:
+Texto: "Oh, não me diga para comer!" exclamou Greta Miller, observando Clyde calmamente como se estivesse a ponderar se ele valia a pena ou não.
+Segmentos:
+1. {{"text": "Oh, não me diga para comer!", "character_id": "greta_miller", "emotion": "tense", "pace": 1.0, "pause_ms": 0}}
+2. {{"text": "exclamou Greta Miller, observando Clyde calmamente como se estivesse a ponderar se ele valia a pena ou não.", "character_id": "narrator", "emotion": "neutral", "pace": 1.0, "pause_ms": 200}}
+
 PERSONAGENS JÁ CONHECIDAS (mantém os IDs):
 {known_list}
-
-REGRAS:
-- Mantém o texto 100% intacto, não inventes nem resumas.
-- Se for narração (sem fala direta), usa character_id "narrator".
-- Fala direta entre aspas « » ou "", ou travessão —, identifica quem fala.
-- Sê consistente com os IDs entre blocos.
 
 TEXTO PARA ANÁLISE:
 \"\"\"{text}\"\"\"
@@ -116,30 +123,3 @@ Responde APENAS com JSON neste formato exato:
     {{"text": "...", "character_id": "maria", "emotion": "joyful", "pace": 1.1, "pause_ms": 300}}
   ]
 }}"""
-
-    json_schema = {
-        "type": "object",
-        "properties": {
-            "characters": {"type": "object"},
-            "segments": {"type": "array"}
-        },
-        "required": ["characters", "segments"]
-    }
-
-    try:
-        r = requests.post(ollama_url, json={
-            "model": model_name, "prompt": prompt, "format": json_schema,
-            "stream": False, "options": {"temperature": 0, "top_k": 1}
-        }, timeout=600)
-        r.raise_for_status()
-        raw = r.json().get('response', '').strip()
-        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            matches = list(re.finditer(r'\{.*\}', raw, flags=re.DOTALL))
-            return json.loads(matches[-1].group()) if matches else {}
-    except Exception as e:
-        logger.warning(f"Erro Ollama no bloco: {e}")
-        return None

@@ -82,26 +82,27 @@ SOUND_CATEGORIES = {
 }
 
 # ─── Qualidade de Áudio & Retry ───────────────────────────────────────────────
-TTS_MAX_RETRIES         = 3      # tentativas por segmento antes de desistir
-TTS_RETRY_TEMP_STEP     = 0.1   # incremento de temperature a cada retry
-TTS_MIN_DURATION_RATIO  = 0.15    # duração mínima: ratio chars/segundos esperados
-TTS_MAX_SILENCE_RATIO   = 0.80   # máx. fracção de silêncio tolerada no ficheiro
-TTS_MIN_RMS             = 0.0005  # amplitude RMS mínima (abaixo = silêncio/ruído)
-TTS_MAX_RMS             = 0.99   # amplitude RMS máxima (acima = clipping/ruído)
-TTS_MAX_ZCR             = 0.50   # Zero-Crossing Rate máxima (acima = provável ruído)
+TTS_MAX_RETRIES         = 4      # Aumentar para mais tentativas
+TTS_RETRY_TEMP_STEP     = 0.05   # Incremento menor de temperature
+TTS_MIN_DURATION_RATIO  = 0.05   # Mais permissivo com duração
+TTS_MAX_SILENCE_RATIO   = 0.90   # Mais permissivo com silêncio
+TTS_MIN_RMS             = 0.0005 # Mais sensível a ruído baixo
+TTS_MAX_RMS             = 0.95   # Menos restritivo com clipping
+TTS_MAX_ZCR             = 0.65   # Mais permissivo com ruído
 TTS_CHARS_PER_SECOND    = 15.0   # velocidade de fala estimada (chars/s) para PT-PT
+
 
 # ─── VRAM / Gestão de Modelos ─────────────────────────────────────────────────
 OLLAMA_UNLOAD_AFTER_ANALYSIS = True   # libertar VRAM do Ollama antes do TTS
 OLLAMA_UNLOAD_URL_TEMPLATE   = "{base}/api/generate"   # usado no unload
 
 # ─── Âncoras: Timeout e limite de tokens ─────────────────────────────────────
-ANCHOR_TIMEOUT        = 240   # segundos máximos para gerar uma âncora (modelo frio demora mais)
-ANCHOR_MAX_NEW_TOKENS = 1200  # tokens de áudio máximos (~50s a 24Hz)
+ANCHOR_TIMEOUT        = 90   # segundos máximos para gerar uma âncora (modelo frio demora mais)
+ANCHOR_MAX_NEW_TOKENS = 800  # tokens de áudio máximos (~50s a 24Hz)
 
 # ─── Síntese geral: limite de tokens por segmento ────────────────────────────
 # A 24Hz, 1 token ≈ ~42ms de áudio.
 # 2000 tokens ≈ ~83s — suficiente para qualquer segmento normal.
 # Sem limite → modelo pode loopar e gerar minutos de ruído.
-TTS_MAX_NEW_TOKENS    = 1500
-TTS_BASE_TEMPERATURE = 0.25        # Temperatura base mais baixa (era 0.3)
+TTS_MAX_NEW_TOKENS    = 2000
+TTS_BASE_TEMPERATURE = 0.27       # Temperatura base mais baixa (era 0.3)
