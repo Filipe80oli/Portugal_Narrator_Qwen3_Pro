@@ -91,6 +91,10 @@ TTS_MAX_RMS             = 0.95   # Menos restritivo com clipping
 TTS_MAX_ZCR             = 0.65   # Mais permissivo com ruído
 TTS_CHARS_PER_SECOND    = 15.0   # velocidade de fala estimada (chars/s) para PT-PT
 
+# Reduzir timeouts para melhor responsividade
+OLLAMA_REQUEST_TIMEOUT = 300  # segundos máximos por requisição
+ANALYSIS_BATCH_SIZE = 3       # Processar 3 blocos por vez
+
 
 # ─── VRAM / Gestão de Modelos ─────────────────────────────────────────────────
 OLLAMA_UNLOAD_AFTER_ANALYSIS = True   # libertar VRAM do Ollama antes do TTS
