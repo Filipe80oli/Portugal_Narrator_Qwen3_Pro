@@ -18,6 +18,9 @@ from config.settings import (
     NARRATOR_PT_PT_INSTRUCT, ANCHOR_TEXT,
     TTS_MAX_RETRIES,
     ANCHOR_TIMEOUT, ANCHOR_MAX_NEW_TOKENS,
+    TTS_MAX_NEW_TOKENS, TTS_BASE_TEMPERATURE,
+    TTS_MIN_RMS, TTS_MAX_ZCR,
+    PTPT_ACCENT_SUFFIX  # <-- ESTA LINHA É OBRIGATÓRIA
 )
 from tts.audio_validator import validate_audio, log_quality
 from tts.vram_manager import release_model, log_vram
@@ -137,37 +140,53 @@ class TTSEngine:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _generate_anchor_sync(self, cid: str, instruct: str,
-                       anchor_path: str, cdata: dict) -> bool:
+                               anchor_path: str, cdata: dict) -> bool:
         """
-        Gera a âncora de voz num executor com timeout real.
-        Retorna True se gerou com sucesso, False em timeout ou erro.
+        Gera âncora com retry interno + validação de qualidade.
+        SEM ThreadPoolExecutor interno — o timeout é gerido pelo asyncio.wait_for
+        em ensure_anchor, evitando conflito entre dois timeouts.
         """
-        def _do_generate():
-            wavs, sr = self.model_design.generate_voice_design(
-                text=ANCHOR_TEXT,
-                instruct=instruct,
-                language="portuguese",
-                temperature=0.2,        # Reduzido
-                top_p=0.8,
-                max_new_tokens=800,     # Reduzido
-            )
-            self._write_audio(wavs, sr, anchor_path)
+        BASE_TEMP = TTS_BASE_TEMPERATURE   # usa constante do settings (0.15)
+        TEMP_STEP = 0.04
 
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_do_generate)
+        for attempt in range(1, TTS_MAX_RETRIES + 1):
+            temp  = min(BASE_TEMP + (attempt - 1) * TEMP_STEP, 0.32)
+            top_p = 0.80 if temp <= 0.20 else max(0.65, 0.80 - (attempt - 1) * 0.04)
+
             try:
-                fut.result(timeout=120)  # Timeout reduzido
-                cdata["ref_audio"] = anchor_path
-                cdata["ref_text"] = ANCHOR_TEXT
-                self.log(f"   ✅ Âncora gerada: {cid}")
-                return True
-            except FuturesTimeout:
-                self.log(f"   ⏰ Timeout ({120}s) ao gerar âncora para {cid}.")
-                fut.cancel()
-                return False
+                self.log(f"   ⚓ Âncora {cid} tentativa {attempt}/{TTS_MAX_RETRIES} "
+                         f"(temp={temp:.2f}, top_p={top_p:.2f})...")
+
+                wavs, sr = self.model_design.generate_voice_design(
+                    text=ANCHOR_TEXT,
+                    instruct=instruct,
+                    language="portuguese",
+                    temperature=temp,
+                    top_p=top_p,
+                    max_new_tokens=ANCHOR_MAX_NEW_TOKENS,  # 260 tokens ≈ 11s
+                )
+
+                if not self._write_audio(wavs, sr, anchor_path):
+                    self.log(f"   ⚠️ [{attempt}] _write_audio falhou.")
+                    continue
+
+                q = validate_audio(anchor_path, ANCHOR_TEXT)
+                if q.ok:
+                    self.log(f"   ✅ Âncora OK [{cid}]: dur={q.duration:.1f}s "
+                             f"rms={q.rms:.4f} zcr={q.zcr:.4f}")
+                    cdata["ref_audio"] = anchor_path
+                    cdata["ref_text"]  = ANCHOR_TEXT
+                    return True
+                else:
+                    self.log(f"   ⚠️ [{attempt}] Âncora inválida: {q.reason} "
+                             f"(rms={q.rms:.4f}, zcr={q.zcr:.4f}, dur={q.duration:.2f}s)")
+                    Path(anchor_path).unlink(missing_ok=True)
+
             except Exception as e:
-                self.log(f"   ❌ Erro ao gerar âncora para {cid}: {e}")
-                return False
+                self.log(f"   ❌ [{attempt}] Excepção: {e}")
+
+        self.log(f"   ❌ Âncora {cid} falhou após {TTS_MAX_RETRIES} tentativas.")
+        return False
 
 
     async def ensure_anchor(self, cid: str, cdata: dict):
@@ -178,11 +197,17 @@ class TTSEngine:
         anchor_path = self.temp_dir / f"anchor_{cid}.wav"
 
         # ── PRIORIDADE 1: Verificar se já existe no disco (reutilizar) ────────
+        # Substituir linhas 183-188:
         if anchor_path.exists() and anchor_path.stat().st_size > 1024:
-            self.log(f"   ♻️ Âncora existente reutilizada: {cid}")
-            cdata["ref_audio"] = str(anchor_path)
-            cdata["ref_text"] = ANCHOR_TEXT
-            return
+            q = validate_audio(str(anchor_path), ANCHOR_TEXT)
+            if q.ok:
+                self.log(f"   ♻️ Âncora reutilizada: {cid} ({q.duration:.1f}s, rms={q.rms:.4f})")
+                cdata["ref_audio"] = str(anchor_path)
+                cdata["ref_text"]  = ANCHOR_TEXT
+                return
+            else:
+                self.log(f"   ♻️❌ Âncora em disco inválida ({q.reason}) — a regenerar...")
+                anchor_path.unlink(missing_ok=True)
 
         # ── PRIORIDADE 2: Já tem áudio e texto de referência → nada a fazer ───
         if cdata.get("ref_audio") and cdata.get("ref_text") is not None:
@@ -198,24 +223,35 @@ class TTSEngine:
         
         # FORÇAR SEMPRE SOTAQUE PORTUGUÊS EUROPEU
         if cid == "narrator":
-            instruct = f"{NARRATOR_PT_PT_INSTRUCT} {base_desc}"
+            instruct = NARRATOR_PT_PT_INSTRUCT
         else:
-            # MODIFICAÇÃO CRÍTICA: Forçar sotaque PT-PT para todas as personagens
-            instruct = f"Voz portuguesa de Portugal. {base_desc}. Sotaque europeu de Portugal, português europeu estrito, sem influência brasileira."
-
-        self.log(f"🇵🇹 A gerar âncora PT-PT para '{cdata.get('name', cid)}': {cid}... (timeout: {ANCHOR_TIMEOUT}s)")
+            # ANTES: instruct = f"Voz portuguesa de Portugal. {base_desc}. Sotaque europeu estrito."
+            # DEPOIS: mesma força que o narrador, adaptada ao género/descrição
+            instruct = (
+                f"{base_desc}."
+                f" Sotaque de Portugal continental, português europeu."
+                f" Vogais fechadas, ritmo europeu. Nunca brasileiro."
+                f" Dicção clara de Lisboa ou Porto."
+            )
 
         # VoiceDesign precisa de estar carregado
         if self.model_design is None:
             await self.load_voicedesign()
 
-        success = await asyncio.to_thread(
-            self._generate_anchor_sync,
-            cid, instruct, str(anchor_path), cdata
-        )
-        
+        try:
+            success = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._generate_anchor_sync,
+                    cid, instruct, str(anchor_path), cdata
+                ),
+                timeout=ANCHOR_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            self.log(f"   ⏰ Timeout ({ANCHOR_TIMEOUT}s) ao gerar âncora para {cid}.")
+            Path(anchor_path).unlink(missing_ok=True)
+            success = False
+
         if not success:
-            # Fallback: sem âncora → síntese por VoiceDesign direta com PT-PT
             self.log(f"   ⚠️ Âncora falhou → '{cdata.get('name', cid)}' usará VoiceDesign PT-PT por segmento.")
             cdata["ref_audio"] = None
             cdata["ref_text"] = None
@@ -250,7 +286,7 @@ class TTSEngine:
 
         # Temperature muito mais baixa + tokens limitados para evitar ruído
         base_temp = 0.15
-        max_tokens = 800  # Limite seguro para Qwen3-TTS
+        max_tokens = TTS_MAX_NEW_TOKENS  
         
         for attempt in range(1, TTS_MAX_RETRIES + 1):
             temp = min(base_temp + (attempt - 1) * 0.05, 0.35)
@@ -260,12 +296,22 @@ class TTSEngine:
                     text=clean, ref_audio=ref_audio, language='portuguese',
                     temperature=temp, top_p=0.85, max_new_tokens=max_tokens,
                 )
-                kwargs["ref_text"] = ref_text if ref_text else ""
-                if not ref_text:
-                    kwargs["x_vector_only_mode"] = True
+                kwargs["ref_text"] = ref_text if ref_text else ANCHOR_TEXT
+                # instruct reforça PT-PT mesmo na clonagem
+                if voice_description:
+                    kwargs["instruct"] = (
+                        f"{voice_description}{PTPT_ACCENT_SUFFIX}"
+                    )
+                else:
+                    kwargs["instruct"] = (
+                        "Sotaque de Portugal continental. Português europeu. "
+                        f"Nunca brasileiro.{PTPT_ACCENT_SUFFIX}"
+                    )
                 
                 wavs, sr = self.model_base.generate_voice_clone(**kwargs)
-                self._write_audio(wavs, sr, out_path)
+                if not self._write_audio(wavs, sr, out_path):
+                    self.log(f"   ⚠️ Tentativa {attempt}: falha ao escrever áudio.")
+                    continue
                 
             except Exception as e:
                 if attempt == TTS_MAX_RETRIES: 
@@ -309,37 +355,59 @@ class TTSEngine:
             text, ref_audio, "neutral", 1.0, out_path, ref_text
         )
 
-    def generate_design(self, text: str, description: str,
-                    emotion: str, out_path: str) -> bool:
-        """Gera voz com VoiceDesign usando temperature muito baixa para evitar ruído."""
-        
+    def generate_design(self, text: str, description: str, emotion: str, out_path: str) -> bool:
+
         is_narrator = "narrator" in description.lower() or "narrador" in description.lower()
         gender_fix = "Voz masculina, homem de Portugal. " if is_narrator else ""
 
         full_instruct = (
             f"{description}. {gender_fix}"
-            "Sotaque de Lisboa, Portugal. Português Europeu. "
-            f"Emoção: {emotion}. Ritmo natural."
+            "Sotaque de Portugal. Português Europeu. "
+            f"Voz clara, sem ruído. Emoção: {emotion}."
+            f"{PTPT_ACCENT_SUFFIX}"   # ← adicionar esta linha
         )
 
-        base_temp = 0.15
-        max_tokens = 800
-        
+        # Temperatura base baixa para estabilidade; sobe ligeiramente a cada falha
+        # para dar ao modelo margem de variação sem explodir para ruído
+        BASE_TEMP = 0.15
+        TEMP_STEP = 0.04
+        MAX_TEMP  = 0.35  # nunca subir acima disto no VoiceDesign
+
         for attempt in range(1, TTS_MAX_RETRIES + 1):
-            temp = min(base_temp + (attempt - 1) * 0.05, 0.35)
+            temp = min(BASE_TEMP + (attempt - 1) * TEMP_STEP, MAX_TEMP)
+            # top_p desce ligeiramente com temp alta para compensar
+            top_p = 0.8 if temp <= 0.2 else max(0.65, 0.8 - (attempt - 1) * 0.04)
+
             try:
+                self.log(f"   🎙️ VoiceDesign tentativa {attempt}/{TTS_MAX_RETRIES} "
+                        f"(temp={temp:.2f}, top_p={top_p:.2f})...")
+
                 wavs, sr = self.model_design.generate_voice_design(
-                    text=text, instruct=full_instruct, language='portuguese',
-                    temperature=temp, top_p=0.85, max_new_tokens=max_tokens,
+                    text=text,
+                    instruct=full_instruct,
+                    language='portuguese',
+                    temperature=temp,
+                    top_p=top_p,
+                    max_new_tokens=TTS_MAX_NEW_TOKENS,
                 )
-                self._write_audio(wavs, sr, out_path)
+
+                if not self._write_audio(wavs, sr, out_path):
+                    self.log(f"   ⚠️ [{attempt}] _write_audio falhou (ruído ou write error)")
+                    continue
+
+                q = validate_audio(out_path, text)
+                if q.ok:
+                    if attempt > 1:
+                        self.log(f"   ✅ VoiceDesign OK na tentativa {attempt}")
+                    return True
+                else:
+                    self.log(f"   ⚠️ [{attempt}] Validação falhou: {q.reason} "
+                            f"(rms={q.rms:.4f}, zcr={q.zcr:.4f})")
+
             except Exception as e:
-                if attempt == TTS_MAX_RETRIES: return False
-                continue
+                self.log(f"   ⚠️ [{attempt}] Excepção VoiceDesign: {e}")
 
-            q = validate_audio(out_path, text)
-            if q.ok: return True
-
+        self.log(f"   ❌ VoiceDesign esgotou {TTS_MAX_RETRIES} tentativas para: {text[:40]}...")
         return False
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -395,6 +463,7 @@ class TTSEngine:
             except Exception as e:
                 # Fallback: se o librosa falhar por algum motivo, guarda o áudio original
                 self.log(f"   ⚠️ Falha ao trimar silêncio: {e}")
+                return False
 
             # 3. Verificar se o áudio não ficou muito curto após o trim
             duration = len(audio) / sr
@@ -409,6 +478,7 @@ class TTSEngine:
 
             # 4. Guardar o ficheiro final
             sf.write(out_path, audio, sr)
+            return True 
             
         except ImportError:
             # Se librosa não estiver disponível, usar método simples
@@ -418,6 +488,7 @@ class TTSEngine:
             if audio.ndim > 1:
                 audio = np.mean(audio, axis=0)
             sf.write(out_path, audio, sr)
+            return True 
 
     def _clean_text(self, text: str) -> str:
         text = text.replace('\u201c', '«').replace('\u201d', '»')

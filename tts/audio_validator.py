@@ -51,13 +51,8 @@ class AudioQuality:
 
 
 def validate_audio(wav_path: str, text: str) -> AudioQuality:
-    """
-    Valida o ficheiro WAV gerado.
-    Retorna AudioQuality com .ok=True se passar todos os testes.
-    """
     path = Path(wav_path)
 
-    # ── 1. Ficheiro existe e tem tamanho razoável ─────────────────────────────
     if not path.exists() or path.stat().st_size < 1024:
         return AudioQuality(False, "ficheiro_vazio_ou_ausente")
 
@@ -66,32 +61,31 @@ def validate_audio(wav_path: str, text: str) -> AudioQuality:
     except Exception as e:
         return AudioQuality(False, f"erro_leitura:{e}")
 
-    # Mono
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
 
     n_samples = len(audio)
     duration  = n_samples / sr
 
-    # ── 2. Duração mínima esperada ────────────────────────────────────────────
-    expected_min = max(0.5, len(text) / TTS_CHARS_PER_SECOND * TTS_MIN_DURATION_RATIO)
+    # ── 1. Duração mínima ─────────────────────────────────────────────────────
+    expected_min = max(1.0, len(text) / TTS_CHARS_PER_SECOND * TTS_MIN_DURATION_RATIO)
     if duration < expected_min:
         return AudioQuality(False, "duracao_insuficiente",
                             duration=duration, expected_min=expected_min)
 
-    # ── 3. RMS global ─────────────────────────────────────────────────────────
+    # ── 2. RMS global ─────────────────────────────────────────────────────────
     rms = float(np.sqrt(np.mean(audio ** 2)))
     if rms < TTS_MIN_RMS:
         return AudioQuality(False, "rms_muito_baixo_silencio", rms=rms, duration=duration)
     if rms > TTS_MAX_RMS:
         return AudioQuality(False, "rms_muito_alto_clipping", rms=rms, duration=duration)
 
-    # ── 4. Rácio de silêncio ──────────────────────────────────────────────────
-    # Frame 20ms para análise de energia
-    frame_len  = int(sr * 0.02)
-    frames     = [audio[i:i+frame_len] for i in range(0, n_samples - frame_len, frame_len)]
+    # ── 3. Análise por frames (20ms) ──────────────────────────────────────────
+    frame_len = int(sr * 0.02)
+    frames    = [audio[i:i+frame_len] for i in range(0, n_samples - frame_len, frame_len)]
+
     if frames:
-        frame_rms    = np.array([np.sqrt(np.mean(f**2)) for f in frames])
+        frame_rms     = np.array([np.sqrt(np.mean(f**2)) for f in frames])
         silence_ratio = float(np.mean(frame_rms < TTS_MIN_RMS))
         if silence_ratio > TTS_MAX_SILENCE_RATIO:
             return AudioQuality(False, "silencio_excessivo",
@@ -99,22 +93,40 @@ def validate_audio(wav_path: str, text: str) -> AudioQuality:
                                 silence_ratio=silence_ratio)
     else:
         silence_ratio = 0.0
+        return AudioQuality(False, "audio_demasiado_curto", duration=duration)
 
-    # ── 5. Zero-Crossing Rate (ruído / língua incompreensível) ────────────────
-    # Calculado apenas na parte activa (acima do limiar RMS)
-    active_mask  = frame_rms >= TTS_MIN_RMS
+    # ── 4. ZCR apenas nas frames activas ──────────────────────────────────────
+    active_mask = frame_rms >= TTS_MIN_RMS
     if active_mask.any():
-        active_audio = np.concatenate([
-            frames[j] for j in range(len(frames)) if active_mask[j]
-        ])
+        active_frames = [frames[j] for j in range(len(frames)) if active_mask[j]]
+        active_audio  = np.concatenate(active_frames)
         zcr = float(np.mean(np.abs(np.diff(np.sign(active_audio)))) / 2)
+
+        # ── 5. NOVO: detector de ruído por variância de ZCR ──────────────────
+        # Fala real tem ZCR variável (sobe nas consoantes, desce nas vogais).
+        # Ruído estático tem ZCR quase constante frame a frame.
+        # Coeficiente de variação (std/mean) < 0.25 em frames activas = ruído.
+        zcr_per_frame = np.array([
+            float(np.mean(np.abs(np.diff(np.sign(f)))) / 2)
+            for f in active_frames
+        ])
+        if len(zcr_per_frame) >= 10:  # mínimo de frames para ser estatisticamente válido
+            zcr_mean = float(np.mean(zcr_per_frame))
+            zcr_std  = float(np.std(zcr_per_frame))
+            zcr_cv   = zcr_std / (zcr_mean + 1e-9)  # coeficiente de variação
+
+            if zcr_mean > TTS_MAX_ZCR:
+                return AudioQuality(False, "zcr_elevado_ruido_provavel",
+                                    rms=rms, zcr=zcr, duration=duration,
+                                    silence_ratio=silence_ratio)
+
+            if zcr_cv < 0.20 and zcr_mean > 0.25:
+                # ZCR alto e constante = ruído, não fala
+                return AudioQuality(False, "zcr_constante_ruido_estatico",
+                                    rms=rms, zcr=zcr, duration=duration,
+                                    silence_ratio=silence_ratio)
     else:
         zcr = 0.0
-
-    if zcr > TTS_MAX_ZCR:
-        return AudioQuality(False, "zcr_elevado_ruido_provavel",
-                            rms=rms, zcr=zcr, duration=duration,
-                            silence_ratio=silence_ratio)
 
     return AudioQuality(True, rms=rms, zcr=zcr, duration=duration,
                         silence_ratio=silence_ratio)

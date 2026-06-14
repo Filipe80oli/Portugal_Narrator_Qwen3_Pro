@@ -816,7 +816,7 @@ class AudiobookApp(ctk.CTk):
         # Verificar quais personagens precisam de âncoras (não têm ref_audio)
         chars_needing_anchors = {cid: cdata for cid, cdata in chars_to_prepare.items() 
                                 if not cdata.get("ref_audio")}
-
+        
         if chars_needing_anchors:
             self.log(f"⚓ Gerando âncoras para {len(chars_needing_anchors)} personagem(ns)...")
             await self.tts.load_voicedesign()
