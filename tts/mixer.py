@@ -18,16 +18,11 @@ from core.sound_db import get_sound_path
 logger = logging.getLogger(__name__)
 
 
+# Em tts/mixer.py, adicionar verificação de duração mínima:
 def mix_segment_cinema(voice_wav: str, sfx_list: list, music: dict | None,
                         out_path: str, temp_dir: Path) -> bool:
     """
     Mistura a pista de voz com efeitos sonoros e música de fundo.
-
-    voice_wav  : caminho do WAV da voz sintetizada
-    sfx_list   : lista de dicts {"sound", "offset_ms", "duration_s", "volume_db"}
-    music      : dict {"sound", "duration_s", "volume_db"} ou None
-    out_path   : caminho de saída
-    temp_dir   : pasta para ficheiros temporários
     """
     # Se não há nada para misturar, copia apenas
     if not sfx_list and not music:
@@ -38,7 +33,7 @@ def mix_segment_cinema(voice_wav: str, sfx_list: list, music: dict | None,
     try:
         # Obter duração da voz
         voice_dur = _get_duration(voice_wav)
-        if voice_dur <= 0:
+        if voice_dur <= 0:  # Menos de 100ms
             import shutil
             shutil.copy2(voice_wav, out_path)
             return True

@@ -1,6 +1,9 @@
 # config/settings.py
 # ─── Configurações globais da aplicação ───────────────────────────────────────
 
+# config/settings.py
+# ─── Configurações globais da aplicação ───────────────────────────────────────
+
 from pathlib import Path
 
 # Modelos Qwen3-TTS
@@ -14,12 +17,6 @@ ANALYSIS_DIR.mkdir(exist_ok=True)
 TEMP_DIR = Path("temp_audio_chunks")
 TEMP_DIR.mkdir(exist_ok=True)
 
-# Base de dados de sons (modo Cinema)
-# Estrutura recomendada:
-#   sounds/nature/rain_heavy.wav
-#   sounds/nature/thunder.wav
-#   sounds/city/traffic.wav
-#   sounds/music/dramatic.wav   ← música de fundo
 SOUNDS_DIR = Path("sounds")
 SOUNDS_DIR.mkdir(exist_ok=True)
 
@@ -44,27 +41,28 @@ NARRATOR_PT_PT_INSTRUCT = (
     "Voz profunda, madura e clara de Portugal."
 )
 
+PTPT_ACCENT_SUFFIX = (
+    " Sotaque de Portugal continental, português europeu. "
+    "Nunca brasileiro. Vogais fechadas, dicção clara de Lisboa."
+)
+
 ANCHOR_TEXT = (
     "Estou a falar com o sotaque de Lisboa, em Portugal. "
     "Esta é a minha voz europeia."
 )
 
 # ─── Modos de Produção ────────────────────────────────────────────────────────
-# "narrator" : uma só voz para todo o texto
-# "novela"   : múltiplas vozes por personagem
-# "cinema"   : novela + música ambiente + efeitos sonoros detetados pelo Ollama
 PRODUCTION_MODES    = ["🎙️ Narrador", "🎭 Novela", "🎬 Cinema"]
 PRODUCTION_MODE_IDS = ["narrator",    "novela",    "cinema"]
 
 # ─── Cinema: volumes de mixagem ───────────────────────────────────────────────
-CINEMA_VOICE_VOL             =   0    # dB (sem alteração)
-CINEMA_SFX_VOL               =  -6    # efeitos 6 dB abaixo da voz
-CINEMA_MUSIC_VOL             = -18    # música de fundo bem abaixo
-
-CINEMA_SFX_DEFAULT_DURATION  = 2.0   # segundos
+CINEMA_VOICE_VOL              =   0
+CINEMA_SFX_VOL                =  -6
+CINEMA_MUSIC_VOL              = -18
+CINEMA_SFX_DEFAULT_DURATION   = 2.0
 CINEMA_MUSIC_DEFAULT_DURATION = 8.0
 
-# ─── Categorias de sons (para fallback na DB) ─────────────────────────────────
+# ─── Categorias de sons ───────────────────────────────────────────────────────
 SOUND_CATEGORIES = {
     "nature":   ["rain", "thunder", "wind", "sea", "river", "fire", "birds",
                  "forest", "storm", "snow", "leaves"],
@@ -80,3 +78,31 @@ SOUND_CATEGORIES = {
     "music":    ["dramatic", "romantic", "tense", "sad", "happy",
                  "mystery", "action", "peaceful", "epic"],
 }
+
+# ─── Qualidade de Áudio & Retry ───────────────────────────────────────────────
+TTS_MAX_RETRIES        = 4
+TTS_RETRY_TEMP_STEP    = 0.05
+TTS_MIN_DURATION_RATIO = 0.40    # era 0.05 — exige duração proporcional ao texto
+TTS_MAX_SILENCE_RATIO  = 0.85    # era 0.90
+TTS_MIN_RMS            = 0.001   # era 0.0005 — chiado Qwen tem RMS ~0.002
+TTS_MAX_RMS            = 0.95
+TTS_MAX_ZCR            = 0.40    # era 0.65 — ruído branco: 0.45-0.60, fala: 0.10-0.35
+TTS_CHARS_PER_SECOND   = 15.0
+
+# ─── Timeouts ─────────────────────────────────────────────────────────────────
+OLLAMA_REQUEST_TIMEOUT = 300
+ANALYSIS_BATCH_SIZE    = 3
+
+# ─── VRAM / Gestão de Modelos ─────────────────────────────────────────────────
+OLLAMA_UNLOAD_AFTER_ANALYSIS = True
+OLLAMA_UNLOAD_URL_TEMPLATE   = "{base}/api/generate"
+
+# ─── Âncoras ──────────────────────────────────────────────────────────────────
+ANCHOR_TIMEOUT        = 60     # era 90 — âncora de 10s não precisa de mais
+ANCHOR_MAX_NEW_TOKENS = 260    # era 800 — 10s × (1/0.042ms) ≈ 238 tokens
+ANCHOR_MAX_RETRIES     = 8   # tentativas para âncoras — mais importante acertar
+
+# ─── Síntese geral ────────────────────────────────────────────────────────────
+# A 24Hz, 1 token ≈ ~42ms. 2000 tokens ≈ ~83s.
+TTS_MAX_NEW_TOKENS   = 2000
+TTS_BASE_TEMPERATURE = 0.15    # era 0.27 — mais baixo = menos ruído
