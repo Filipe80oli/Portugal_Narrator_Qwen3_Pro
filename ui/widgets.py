@@ -7,7 +7,7 @@ from config.settings import PRODUCTION_MODES, PRODUCTION_MODE_IDS
 
 
 def build_header(app):
-    ctk.CTkLabel(app, text="Portugal Narrator Qwen3 Pro v7.3",
+    ctk.CTkLabel(app, text="Portugal Narrator Pro v1.1",
                  font=("Roboto", 26, "bold")).pack(pady=(15, 3))
     ctk.CTkLabel(app, text="Qwen3-TTS Base (clone) + VoiceDesign (auto) • Cache de Análise",
                  font=("Roboto", 13), text_color="#3498db").pack(pady=(0, 10))
