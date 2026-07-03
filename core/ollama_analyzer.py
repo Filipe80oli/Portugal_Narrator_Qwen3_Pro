@@ -1,10 +1,10 @@
 # core/ollama_analyzer.py
 """
-Análise do livro via Ollama (deteção de personagens, segmentação e aliases).
-Versão consolidada com prompt original que funcionou com gemma3:27b.
-Correções: aumento de num_predict/num_ctx, recuperação de JSON truncado,
-verificação de tipo para evitar "str" object does not support item assignment.
+Análise do livro via Ollama – Versão com separação em duas fases:
+Fase 1 – Extração de personagens (varredura rápida)
+Fase 2 – Segmentação com elenco conhecido
 """
+
 import re
 import json
 import logging
@@ -15,144 +15,14 @@ from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
-def repair_truncated_json(raw: str) -> str:
-    """
-    Repara JSON truncado fechando as estruturas abertas na ordem correta (LIFO).
-    Estratégia:
-    1. Cortar na última vírgula antes do truncamento (remove o segmento incompleto).
-    2. Fechar colchetes e chavetas na ordem inversa à abertura, usando uma stack.
-    3. Verificar com json.loads; se falhar, fazer fallback para cortar até ao último } ou ].
-    """
-    if not raw.strip():
-        return raw
-    raw = raw.strip()
-
-    # ── PASSO 1: Cortar o último item incompleto ───────────────────────────
-    # Se o JSON está truncado a meio de um objeto de segmento, o último item
-    # provavelmente está incompleto. Cortar na última vírgula que precede
-    # um '{' sem fechar é mais seguro do que tentar fechar strings abertas.
-    # Encontrar a posição do último '}' completo (heurística: último '}' antes
-    # de qualquer conteúdo incompleto).
-
-    # Abordagem: percorrer com stack para saber onde o JSON está completo
-    stack = []
-    in_string = False
-    escape_next = False
-    last_complete_pos = -1  # posição do último char onde a estrutura estava "completa"
-
-    for i, ch in enumerate(raw):
-        if escape_next:
-            escape_next = False
-            continue
-        if ch == '\\' and in_string:
-            escape_next = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch in ('{', '['):
-            stack.append(ch)
-        elif ch in ('}', ']'):
-            if stack:
-                stack.pop()
-            if not stack:
-                last_complete_pos = i  # estrutura raiz fechada aqui
-
-    # Se a stack está vazia, o JSON já é válido
-    if not stack:
-        try:
-            json.loads(raw)
-            return raw
-        except json.JSONDecodeError:
-            pass  # Há outro problema, continuar com o repair
-
-    # ── PASSO 2: Tentar cortar o último elemento incompleto ───────────────
-    # Encontrar a última vírgula fora de strings (antes do truncamento)
-    in_string = False
-    escape_next = False
-    last_comma_pos = -1
-
-    for i, ch in enumerate(raw):
-        if escape_next:
-            escape_next = False
-            continue
-        if ch == '\\' and in_string:
-            escape_next = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == ',':
-            last_comma_pos = i
-
-    if last_comma_pos > 0:
-        candidate = raw[:last_comma_pos]
-        # Recalcular a stack para o candidate
-        stack2 = []
-        in_string2 = False
-        escape_next2 = False
-        for ch in candidate:
-            if escape_next2:
-                escape_next2 = False
-                continue
-            if ch == '\\' and in_string2:
-                escape_next2 = True
-                continue
-            if ch == '"':
-                in_string2 = not in_string2
-                continue
-            if in_string2:
-                continue
-            if ch in ('{', '['):
-                stack2.append(ch)
-            elif ch in ('}', ']'):
-                if stack2:
-                    stack2.pop()
-
-        # Fechar a stack2 na ordem inversa
-        closing = ''
-        for opener in reversed(stack2):
-            closing += '}' if opener == '{' else ']'
-        repaired = candidate + closing
-        try:
-            json.loads(repaired)
-            return repaired
-        except json.JSONDecodeError:
-            pass  # falhou, tentar outro método
-
-    # ── PASSO 3: Fechar com a stack original (sem cortar) ─────────────────
-    closing = ''
-    for opener in reversed(stack):
-        closing += '}' if opener == '{' else ']'
-    repaired = raw + closing
-    try:
-        json.loads(repaired)
-        return repaired
-    except json.JSONDecodeError:
-        pass
-
-    # ── PASSO 4: Fallback — varrer de trás para a frente até parsear ──────
-    for i in range(len(raw) - 1, -1, -1):
-        if raw[i] in ('}', ']'):
-            try:
-                json.loads(raw[:i + 1])
-                return raw[:i + 1]
-            except json.JSONDecodeError:
-                continue
-
-    return raw
-
 # ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTES
 # ═══════════════════════════════════════════════════════════════════════════
 TIMEOUT_SMALL = 120
 TIMEOUT_MEDIUM = 300
 TIMEOUT_LARGE = 600
-MAX_BLOCK_SIZE = 1500  # reduzido para evitar respostas demasiado longas
+MAX_BLOCK_SIZE = 1500  # tamanho padrão para a Fase 2 (segmentação)
+MAX_BLOCK_SIZE_CHAR_EXTRACTION = 6000  # tamanho maior para a Fase 1 (personagens)
 
 # Padrão para títulos/cabeçalhos (forçar emotion: neutral)
 TITLE_PATTERN = re.compile(
@@ -256,6 +126,106 @@ def map_emotion(raw_emotion: str) -> str:
     return "neutral"
 
 
+def repair_truncated_json(raw: str) -> str:
+    """Repara JSON truncado fechando estruturas abertas na ordem correta."""
+    if not raw.strip():
+        return raw
+    raw = raw.strip()
+
+    # PASSO 1: Cortar último item incompleto (antes da vírgula)
+    in_string = False
+    escape_next = False
+    last_comma_pos = -1
+    for i, ch in enumerate(raw):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == ',':
+            last_comma_pos = i
+
+    if last_comma_pos > 0:
+        candidate = raw[:last_comma_pos]
+        # tentar fechar
+        stack = []
+        in_string2 = False
+        esc2 = False
+        for ch in candidate:
+            if esc2:
+                esc2 = False
+                continue
+            if ch == '\\' and in_string2:
+                esc2 = True
+                continue
+            if ch == '"':
+                in_string2 = not in_string2
+                continue
+            if in_string2:
+                continue
+            if ch in ('{', '['):
+                stack.append(ch)
+            elif ch in ('}', ']'):
+                if stack:
+                    stack.pop()
+        closing = ''
+        for opener in reversed(stack):
+            closing += '}' if opener == '{' else ']'
+        repaired = candidate + closing
+        try:
+            json.loads(repaired)
+            return repaired
+        except json.JSONDecodeError:
+            pass
+
+    # PASSO 2: Fechar com stack original (sem cortar)
+    stack = []
+    in_string = False
+    esc = False
+    for ch in raw:
+        if esc:
+            esc = False
+            continue
+        if ch == '\\' and in_string:
+            esc = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in ('{', '['):
+            stack.append(ch)
+        elif ch in ('}', ']'):
+            if stack:
+                stack.pop()
+    closing = ''
+    for opener in reversed(stack):
+        closing += '}' if opener == '{' else ']'
+    repaired = raw + closing
+    try:
+        json.loads(repaired)
+        return repaired
+    except json.JSONDecodeError:
+        pass
+
+    # PASSO 3: Fallback – varrer de trás para a frente
+    for i in range(len(raw) - 1, -1, -1):
+        if raw[i] in ('}', ']'):
+            try:
+                json.loads(raw[:i + 1])
+                return raw[:i + 1]
+            except json.JSONDecodeError:
+                continue
+    return raw
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. GESTÃO DE MODELOS OLLAMA
 # ═══════════════════════════════════════════════════════════════════════════
@@ -269,16 +239,11 @@ def get_ollama_models(base_url: str) -> List[str]:
         return ["gemma3:27b"]
 
 def warmup_ollama(ollama_url: str, model_name: str, timeout: int = 120):
-    """
-    Carrega o modelo em memória e mantém-no carregado indefinidamente (keep_alive=-1).
-    keep_alive deve ser inteiro, não string — "-1s" causa HTTP 400 em versões recentes.
-    num_predict=1 evita gerar tokens desnecessários durante o warmup.
-    """
     try:
         requests.post(ollama_url, json={
             "model": model_name,
             "prompt": "ok",
-            "keep_alive": -1,          # inteiro, não string "-1s"
+            "keep_alive": -1,
             "stream": False,
             "options": {"temperature": 0, "num_predict": 1}
         }, timeout=timeout)
@@ -321,34 +286,18 @@ def split_into_blocks(text: str, max_chars: int = MAX_BLOCK_SIZE) -> List[str]:
 # ═══════════════════════════════════════════════════════════════════════════
 def sanitize_segments(raw_segments: List[Any]) -> List[Dict[str, Any]]:
     result = []
-
-    # ── DETEÇÃO DE LIXO ESTRUTURAL ──────────────────────────────────────────
-    # BUG CORRIGIDO: a lista antiga (JUNK_KEYWORDS) continha palavras comuns
-    # como "narrator", "text", "pace", "emotion" e procurava-as como SUBSTRING
-    # dentro do texto literário do segmento. Isto descartava silenciosamente
-    # qualquer frase que contivesse essas substrings por coincidência
-    # (ex: "narrador", "contexto", "pretexto", ou qualquer ocorrência de
-    # "narrator"/"character_id" mencionada no próprio livro).
-    # A nova verificação só marca como lixo fragmentos que estruturalmente
-    # parecem ser JSON mal-formado que vazou para o campo "text" (chaves,
-    # colchetes, ou pares "chave": valor típicos de JSON), não texto em prosa.
     _json_leak_pattern = re.compile(
         r'"(?:character_id|pause_ms|emotion|pace|text|segments|characters)"\s*:'
     )
 
     def _is_junk(text: str) -> bool:
-        # Só conteúdo estritamente de pontuação/símbolos
         if re.match(r'^[\s\.\,\;\:\!\?\-{}\[\]"\'()]+$', text):
             return True
-        # Fragmento de JSON que vazou para o texto (ex: '..."character_id": "narrator"...')
         if _json_leak_pattern.search(text):
             return True
-        # Chaves/colchetes nus sem conteúdo literário à volta (não basta conter "{" — tem de ser
-        # maioritariamente estrutura JSON)
         symbol_chars = sum(1 for c in text if c in '{}[]":')
         if len(text) > 0 and symbol_chars / len(text) > 0.3:
             return True
-        # Caracteres CJK / árabe (idiomas não esperados nesta pipeline PT-PT)
         if re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\u0600-\u06ff]', text):
             return True
         return False
@@ -359,24 +308,19 @@ def sanitize_segments(raw_segments: List[Any]) -> List[Dict[str, Any]]:
             text = str(item.get("text", "")).strip()
             if not text or len(text) < 3:
                 continue
-
             if _is_junk(text):
                 continue
-
             character_id = item.get("character_id", "narrator")
             if isinstance(character_id, list):
                 character_id = character_id[0] if character_id else "narrator"
             character_id = str(character_id).strip().lower().replace(" ", "_") or "narrator"
-
             emotion = item.get("emotion", "neutral")
             if isinstance(emotion, list):
                 emotion = emotion[0] if emotion else "neutral"
             emotion = str(emotion).strip().lower() or "neutral"
             emotion = map_emotion(emotion)
-
             if TITLE_PATTERN.match(text):
                 emotion = "neutral"
-
             pace = item.get("pace", 1.0)
             if isinstance(pace, list):
                 pace = pace[0] if pace else 1.0
@@ -385,7 +329,6 @@ def sanitize_segments(raw_segments: List[Any]) -> List[Dict[str, Any]]:
                 pace = max(0.5, min(2.0, pace))
             except (ValueError, TypeError):
                 pace = 1.0
-
             text_len = len(text)
             if text_len < 30:
                 pause_ms = 150
@@ -399,7 +342,6 @@ def sanitize_segments(raw_segments: List[Any]) -> List[Dict[str, Any]]:
                 pause_ms = 800
             if re.match(r'^(cap[ií]tulo|livro|parte)\s+', text, re.IGNORECASE):
                 pause_ms = 1200
-
             result.append({
                 "text": text,
                 "character_id": character_id,
@@ -407,7 +349,6 @@ def sanitize_segments(raw_segments: List[Any]) -> List[Dict[str, Any]]:
                 "pace": pace,
                 "pause_ms": pause_ms,
             })
-
         elif isinstance(item, str):
             text = item.strip()
             if text and len(text) >= 3 and not _is_junk(text):
@@ -421,100 +362,227 @@ def sanitize_segments(raw_segments: List[Any]) -> List[Dict[str, Any]]:
                     "text": text, "character_id": "narrator",
                     "emotion": emotion, "pace": 1.0, "pause_ms": pause_ms
                 })
-
         elif isinstance(item, list):
             result.extend(sanitize_segments(item))
-
-    n_in = len(raw_segments)
-    n_out = len(result)
-    if n_in > 0 and n_out < n_in:
-        dropped = n_in - n_out
-        ratio = dropped / n_in
-        if ratio > 0.2:
-            logger.warning(
-                f"sanitize_segments: {dropped}/{n_in} segmentos descartados ({ratio:.0%}). "
-                f"Se esta percentagem parecer alta, verificar _is_junk()."
-            )
-        else:
-            logger.debug(f"sanitize_segments: {dropped}/{n_in} segmentos descartados ({ratio:.0%}).")
-
     return result
+
+async def extract_characters_from_text(
+    ollama_url: str,
+    model_name: str,
+    full_text: str,
+    max_block_size: int = MAX_BLOCK_SIZE_CHAR_EXTRACTION,
+    user_settings: Optional[Dict[str, Any]] = None
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Percorre o texto em blocos e extrai todas as personagens.
+    Versão com maior robustez a respostas mal formatadas.
+    """
+    blocks = split_into_blocks(full_text, max_chars=max_block_size)
+    all_chars = {}
+    total = len(blocks)
+    
+    # Timeout mais longo para extração (usar large)
+    timeout = user_settings.get("ollama_timeout_large", 600) if user_settings else 600
+
+    for idx, block in enumerate(blocks):
+        logger.info(f"🔎 Extraindo personagens – bloco {idx+1}/{total} ({len(block)} chars)")
+        
+        # Prompt simplificado para reduzir a carga do modelo
+        prompt = f"""Analisa o seguinte excerto de um livro em português de Portugal.
+
+Tarefa: Identifica TODAS as personagens que aparecem neste excerto (incluindo as que apenas são mencionadas).
+Para cada personagem, fornece:
+- Nome próprio (como aparece no texto)
+- Uma breve descrição da VOZ (género, idade aproximada, tom, sotaque – sempre português de Portugal)
+
+Regras:
+- Usa IDs em minúsculas com underscores (ex: "joao_silva").
+- Inclui personagens sem nome próprio, usando um ID descritivo (ex: "jovem_empregado").
+- A descrição deve ser sobre a voz, nunca sobre aspeto físico.
+- Se não houver personagens, devolve {{"personagens": {{}}}}.
+
+Responde APENAS com JSON no formato:
+{{"personagens": {{"id1": {{"name": "Nome", "description": "Voz ..."}}, "id2": {{...}}}}}}
+
+Excerto:
+""" + block
+
+        # Tentativas com backoff
+        for attempt in range(3):  # até 3 tentativas
+            try:
+                def _make_request():
+                    return requests.post(ollama_url, json={
+                        "model": model_name,
+                        "prompt": prompt,
+                        "stream": False,
+                        "keep_alive": -1,
+                        "options": {
+                            "temperature": 0.0,
+                            "top_k": 10,
+                            "repeat_penalty": 1.1,
+                            "num_ctx": 8192 + (attempt * 4096),  # aumenta a cada tentativa
+                            "num_predict": 2048 + (attempt * 1024)
+                        }
+                    }, timeout=timeout + (attempt * 60))  # aumenta timeout
+
+                r = await asyncio.to_thread(_make_request)
+                r.raise_for_status()
+                raw = r.json().get('response', '').strip()
+                
+                # Limpeza agressiva
+                raw = raw.replace('```json', '').replace('```', '').strip()
+                # Remover tudo antes do primeiro '{' e depois do último '}'
+                first_brace = raw.find('{')
+                last_brace = raw.rfind('}')
+                if first_brace != -1 and last_brace != -1:
+                    raw = raw[first_brace:last_brace+1]
+                else:
+                    # Se não encontrar chavetas, tentar extrair com regex
+                    match = re.search(r'(\{.*\})', raw, re.DOTALL)
+                    if match:
+                        raw = match.group(1)
+                    else:
+                        logger.warning(f"Bloco {idx+1}: nenhum JSON detetado. Resposta: {raw[:200]}...")
+                        break  # passa ao próximo bloco
+
+                # Verificar se o JSON está truncado
+                if raw.count('{') > raw.count('}') or raw.count('[') > raw.count(']'):
+                    raw = repair_truncated_json(raw)
+                    logger.debug(f"Bloco {idx+1}: JSON reparado.")
+
+                data = json.loads(raw)
+                personagens = data.get("personagens", {})
+                if not personagens:
+                    logger.info(f"Bloco {idx+1}: nenhuma personagem encontrada.")
+                    break  # sucesso, mas vazio
+
+                for cid, cdata in personagens.items():
+                    if not isinstance(cdata, dict):
+                        continue
+                    cid_clean = str(cid).strip().lower().replace(" ", "_")
+                    if not cid_clean:
+                        continue
+                    if "name" not in cdata:
+                        cdata["name"] = cid_clean
+                    if "description" not in cdata or not cdata["description"].strip():
+                        cdata["description"] = f"Voz de {cdata['name']}, português de Portugal, tom neutro."
+                    cdata["type"] = "character"
+                    # Fundir com o dicionário global (manter descrição mais longa)
+                    if cid_clean in all_chars:
+                        if len(cdata.get("description", "")) > len(all_chars[cid_clean].get("description", "")):
+                            all_chars[cid_clean]["description"] = cdata["description"]
+                    else:
+                        all_chars[cid_clean] = cdata
+                break  # sucesso, sair do loop de tentativas
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"Bloco {idx+1}, tentativa {attempt+1}: JSON inválido - {e}")
+                if attempt == 2:
+                    # Fallback: tentar extrair nomes próprios via regex
+                    names = re.findall(r'\b([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][a-záâãàéêíóôõúç]+)\b', block)
+                    for name in set(names):
+                        if len(name) < 3 or name.lower() in ('um', 'uma', 'o', 'a', 'os', 'as'):
+                            continue
+                        cid = name.lower()
+                        if cid not in all_chars:
+                            all_chars[cid] = {
+                                "name": name,
+                                "type": "character",
+                                "description": f"Voz de {name}, português de Portugal, tom neutro."
+                            }
+                    logger.info(f"Bloco {idx+1}: fallback – extraídos {len(set(names))} nomes por regex.")
+                continue
+            except requests.exceptions.Timeout:
+                logger.warning(f"Bloco {idx+1}, tentativa {attempt+1}: timeout")
+                if attempt == 2:
+                    logger.error(f"Bloco {idx+1}: falhou após 3 tentativas (timeout).")
+                continue
+            except Exception as e:
+                logger.warning(f"Bloco {idx+1}, tentativa {attempt+1}: erro - {e}")
+                if attempt == 2:
+                    logger.error(f"Bloco {idx+1}: falhou após 3 tentativas.")
+                continue
+
+    # Garantir que existe narrador
+    if "narrator" not in all_chars:
+        all_chars["narrator"] = {
+            "name": "Narrador",
+            "type": "narrator",
+            "description": "Voz masculina madura, português de Portugal, tom neutro e sóbrio."
+        }
+
+    logger.info(f"✅ Fase 1 concluída: {len(all_chars)} personagens encontradas.")
+    return all_chars
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 4. ANÁLISE DE BLOCO (PROMPT ORIGINAL QUE FUNCIONOU)
+# 5. FASE 2 – ANÁLISE DE BLOCO COM ELENCO CONHECIDO
 # ═══════════════════════════════════════════════════════════════════════════
 async def analyze_block(
     ollama_url: str,
     model_name: str,
     text: str,
     context: str,
-    known_chars: Dict[str, Any],
+    known_characters: Optional[Dict[str, Dict[str, Any]]] = None,
     aliases: Optional[Dict[str, List[str]]] = None,
     max_retries: int = 2,
     user_settings: Optional[Dict[str, Any]] = None
 ) -> Optional[Dict[str, Any]]:
     """
-    Envia um bloco ao Ollama e retorna personagens + segmentos (Assíncrono).
+    Segmenta o bloco usando a lista de personagens conhecidas.
+    Retorna dicionário com "segments" e, opcionalmente, "characters" (novas personagens).
     """
-    # ─── DEFINIR text_length LOGO NO INÍCIO ────────────────────────────────
-    text_length = len(text)
+    if known_characters is None:
+        known_characters = {}
 
-    # ─── CONSTRUIR known_list e alias_text ──────────────────────────────────
-    known_list = "\n".join([
-        f"- {cid}: {c.get('name', cid)}"
-        for cid, c in known_chars.items()
-        if isinstance(c, dict) and c
-    ]) if known_chars else "(nenhuma ainda)"
+    # Construir lista de personagens conhecidas
+    char_list_lines = []
+    for cid, cdata in known_characters.items():
+        if not isinstance(cdata, dict):
+            continue
+        name = cdata.get("name", cid)
+        char_list_lines.append(f"- {cid}: {name}")
+    char_list = "\n".join(char_list_lines) if char_list_lines else "(nenhuma personagem conhecida)"
 
+    # Construir alias_text se fornecido
     alias_text = ""
     if aliases:
         alias_lines = []
         for cid, terms in aliases.items():
-            if cid in known_chars:
+            if cid in known_characters:
                 alias_lines.append(f"- {cid}: {', '.join(terms)}")
         if alias_lines:
             alias_text = "\nALIASES CONHECIDOS (usa estes para mapear termos genéricos):\n" + "\n".join(alias_lines) + "\n"
 
     context_block = f"CONTEXTO:\n{context[:500]}...\n\n" if context else ""
 
-    # ─── DEFINIR TIMEOUTS COM BASE NAS DEFINIÇÕES DO UTILIZADOR ────────────
+    # Definir timouts e parâmetros dinâmicos
+    text_length = len(text)
     small = user_settings.get("ollama_timeout_small", TIMEOUT_SMALL) if user_settings else TIMEOUT_SMALL
     medium = user_settings.get("ollama_timeout_medium", TIMEOUT_MEDIUM) if user_settings else TIMEOUT_MEDIUM
     large = user_settings.get("ollama_timeout_large", TIMEOUT_LARGE) if user_settings else TIMEOUT_LARGE
 
-    # ─── PARÂMETROS DINÂMICOS ────────────────────────────────────────────────
-    # Estimar tokens do prompt: ~1500 fixos + 1 token por ~4 chars de texto.
-    # Adicionar margem de 2× para a resposta JSON.
-    # num_ctx mínimo: 8192. Máximo: 32768 (evitar KV cache gigante que causa timeout).
     estimated_prompt_tokens = 1500 + (text_length // 4)
-    # A resposta JSON tem ~1 token por char; um bloco de 1500 chars gera ~2000 tokens de JSON
     estimated_response_tokens = max(4096, text_length * 2)
     needed_ctx = estimated_prompt_tokens + estimated_response_tokens
-
-    base_num_ctx     = max(8192, min(needed_ctx, 32768))
-    # Arredondar para a potência de 2 mais próxima para eficiência
+    base_num_ctx = max(8192, min(needed_ctx, 32768))
     for p in (8192, 16384, 32768):
         if base_num_ctx <= p:
             base_num_ctx = p
             break
-
     base_num_predict = min(estimated_response_tokens, base_num_ctx - estimated_prompt_tokens)
     base_num_predict = max(4096, base_num_predict)
 
-    # Sobrescrever com definições do utilizador se forem maiores
     user_num_predict = user_settings.get("ollama_num_predict", 0) if user_settings else 0
-    user_num_ctx     = user_settings.get("ollama_num_ctx",     0) if user_settings else 0
+    user_num_ctx = user_settings.get("ollama_num_ctx", 0) if user_settings else 0
     if user_num_predict > 0:
         base_num_predict = user_num_predict
     if user_num_ctx > 0:
         base_num_ctx = user_num_ctx
 
     num_predict = base_num_predict
-    num_ctx     = base_num_ctx
+    num_ctx = base_num_ctx
 
-    # Timeout: escalar com num_ctx (KV cache maior = mais tempo de prefill)
-    # Fórmula: small para ≤8k ctx, medium para ≤16k, large para >16k
     if num_ctx <= 8192:
         timeout = small
     elif num_ctx <= 16384:
@@ -522,131 +590,53 @@ async def analyze_block(
     else:
         timeout = large
 
-    logger.debug(
-        f"analyze_block: {text_length} chars → "
-        f"num_ctx={num_ctx}, num_predict={num_predict}, timeout={timeout}s"
-    )
-    prompt = f'''{context_block}/no_think
-Analisa este trecho em PT-PT. Identifica TODAS as falas e classifica a EMOÇÃO com base em:
+    prompt = f"""{context_block}/no_think
+Analisa este trecho em PT-PT. Segmenta o texto em unidades de fala ou narração.
 
-🔹 **PISTAS CONTEXTUAIS** (ordem de prioridade):
-1. Verbos dicendi → emoção implícita:
-   - "gritou", "berrou", "trovejou" → **angry**
-   - "sussurrou", "cochichou", "murmurou" → **whisper**
-   - "exclamou", "gritou de alegria" → **joyful**
-   - "soluçou", "disse com lágrimas" → **sad**
-   - "tremia", "disse com medo" → **fearful**
-   - "respondeu", "disse" (neutro) → **neutral** (a menos que haja pista explícita de calma)
-
-2. Pontuação:
-   - "!!" → **angry** ou **joyful**
-   - "..." → **sad**, **tense** ou **fearful**
-   - "?" → **tense** (dúvida, surpresa)
-
-3. Palavras de intensidade:
-   - "oh!", "ah!", "uau!" → **joyful**
-   - "ai!", "meu Deus!" → **fearful**, **sad** ou **angry**
-
-4. Tom da descrição:
-   - "calmamente", "serenamente" → **calm**
-   - "nervosamente", "hesitante" → **tense**
-   - "com raiva", "irado" → **angry**
-
-⚠️ REGRA MAIS IMPORTANTE SOBRE DESCRIÇÕES DE VOZ:
-Para CADA personagem (exceto o narrador), a descrição DEVE ser estritamente sobre a sua VOZ.
-NUNCA incluas aspetos físicos (altura, cabelo, olhos) ou relações familiares (esposa, filho).
-A descrição deve conter OBRIGATORIAMENTE:
-- Género (masculino/feminino)
-- Idade (aproximada: "jovem", "30-40", "idoso")
-- Tom de voz (ex: "grave", "aguda", "suave", "autoritária")
-- Sotaque: "Português de Portugal" (sempre)
-
-Exemplos CORRETOS:
-✅ "Voz masculina, 50 anos, grave e autoritária, sotaque de Lisboa."
-✅ "Voz feminina, jovem (16-18), aguda e ansiosa, sotaque do Porto."
-✅ "Voz masculina, madura, calma e serena, sotaque de Portugal continental."
-
-Exemplos INCORRETOS (NUNCA usar):
-❌ "Homem de uns cinquenta anos." (falta voz)
-❌ "Mulher com convicção." (não é voz)
-❌ "Jovem alto e franzino." (físico, não voz)
-
-REGRAS:
-- Se não houver pistas claras de emoção → **neutral**
-- **NUNCA** atribuas uma emoção sem pista; usa `neutral` apenas como último recurso.
-Emoções permitidas: neutral, calm, tense, joyful, sad, angry, fearful, whisper.
-
----
-
-REGRAS GERAIS:
-1. **Narrador**: usa `"character_id": "narrator"` APENAS para:
-   - Texto descritivo (acções, cenários, movimentos)
-   - Pensamentos do narrador
-   - Títulos, cabeçalhos, epígrafes, notas
-   - Texto que não é fala de ninguém
-
-2. **Diálogo (fala de personagens)**:
-   - Sempre que houver aspas (« » ou " ") ou travessão (—) a indicar fala.
-   - Identifica a personagem pelo seu **nome próprio** (ex: "asa_griffiths").
-   - Se o falante for referido como "o pai", "a mãe", etc., usa o alias correspondente.
-   - **IMPORTANTE**: Se uma personagem fala mas NÃO tem nome próprio (ex: "um jovem empregado", "um vagabundo", "uma senhora", "um transeunte"), CRIA um ID descritivo em minúsculas com underscores (ex: "jovem_empregado", "vagabundo", "senhora", "transeunte").
-   - **NUNCA** atribuas uma fala a `"narrator"` se houver aspas ou travessão a indicar que alguém está a falar.
-
-3. **Nomes próprios**: usa sempre minúsculas e underscores (ex: "clyde_griffiths").
-
-4. **Aliases**: sempre que vires "pai", "o pai", usa "asa_griffiths"; "mãe", "a mãe" → "elvira_griffiths".
-
-5. **Emoção**: usa APENAS: neutral, calm, tense, joyful, sad, angry, fearful, whisper.
-
-6. **Títulos e cabeçalhos**: devem ser marcados como `"character_id": "narrator"` e `"emotion": "neutral"`.
-
-PERSONAGENS JÁ CONHECIDAS (usa estes IDs sempre que possível):
-{known_list}
+PERSONAGENS CONHECIDAS (usa APENAS estes IDs sempre que possível):
+{char_list}
 
 {alias_text}
 
+Tarefa: Para cada segmento, indica:
+- O ID da personagem que fala (deve ser um dos IDs da lista acima)
+- A emoção (neutral, calm, tense, joyful, sad, angry, fearful, whisper)
+- Ritmo (pace, entre 0.5 e 2.0)
+- Pausa (pause_ms, em milissegundos)
+
+REGRAS:
+- O narrador é identificado como "narrator".
+- Se uma fala pertencer a uma personagem que NÃO está na lista, cria um novo ID descritivo (ex: "jovem_empregado", "transeunte") e adiciona-o à lista de personagens no campo "characters" da resposta.
+- As emoções devem ser inferidas a partir de pistas contextuais (verbos, pontuação, palavras de intensidade).
+- **Nunca** atribuas uma fala ao narrador se houver aspas ou travessão a indicar que alguém está a falar.
+- Títulos e cabeçalhos devem ser marcados como "narrator" com "neutral".
+- Para descrições de voz de novas personagens, segue o padrão: "Voz [género], [idade], [tom], português de Portugal."
+
 EXEMPLOS:
 - Texto: — Vamos cantar o hino, disse o pai.
-  Saída: {{"character_id": "asa_griffiths", "emotion": "calm", "pace": 1.0, "pause_ms": 300}}
+  Saída: {{"character_id": "pai", "emotion": "calm", "pace": 1.0, "pause_ms": 300}}
 
 - Texto: "Vejo estas pessoas por aqui quase todas as noites", disse um jovem empregado.
   Saída: {{"character_id": "jovem_empregado", "emotion": "neutral", "pace": 1.0, "pause_ms": 200}}
 
-- Texto: "Aquele miúdo mais velho não quer estar aqui", observou um vagabundo.
-  Saída: {{"character_id": "vagabundo", "emotion": "neutral", "pace": 1.0, "pause_ms": 200}}
-
-- Texto: "É, acho que sim", concordou o outro transeunte.
-  Saída: {{"character_id": "transeunte", "emotion": "neutral", "pace": 1.0, "pause_ms": 150}}
-
 - Texto: Capítulo 1 — O Início
   Saída: {{"character_id": "narrator", "emotion": "neutral", "pace": 1.0, "pause_ms": 800}}
 
+Responde APENAS com JSON válido no formato:
+{{"segments": [{{"text": "...", "character_id": "...", "emotion": "...", "pace": 1.0, "pause_ms": 0}}], "characters": {{"novo_id": {{"name": "Nome", "description": "Voz ..."}}}}}}
+
 TEXTO A ANALISAR:
-""" {text} """
+""" + text
 
-Responde APENAS com JSON válido, sem texto extra.
-JSON: {{"characters": {{"narrator": {{"name": "Narrador", "type": "narrator", "description": "Voz masculina madura, português de Portugal"}}}}, "segments": [{{"text": "...", "character_id": "narrator", "emotion": "neutral", "pace": 1.0, "pause_ms": 0}}]}}'''
-
-    # ─── SCHEMA JSON ──────────────────────────────────────────────────────────
-    json_schema = {
-        "type": "object",
-        "properties": {
-            "characters": {"type": "object"},
-            "segments": {"type": "array"}
-        },
-        "required": ["characters", "segments"]
-    }
-
-    # ─── LOOP DE TENTATIVAS ──────────────────────────────────────────────────
+    # Loop de tentativas
     for attempt in range(max_retries + 1):
         try:
             def _make_request():
                 return requests.post(ollama_url, json={
                     "model": model_name,
                     "prompt": prompt,
-                    "format": json_schema,
                     "stream": False,
-                    "keep_alive": -1,      # mantém o modelo em memória após a resposta
+                    "keep_alive": -1,
                     "options": {
                         "temperature": 0.1,
                         "top_k": 20,
@@ -660,127 +650,85 @@ JSON: {{"characters": {{"narrator": {{"name": "Narrador", "type": "narrator", "d
             r = await asyncio.to_thread(_make_request)
             r.raise_for_status()
             raw = r.json().get('response', '').strip()
-
-            # ── LOG DA RESPOSTA BRUTA (para diagnóstico) ──────────────────────
-            logger.debug(f"Resposta bruta (início): {raw[:200]}...")
-
-            # ── LIMPEZA E EXTRAÇÃO DO JSON ────────────────────────────────────
             raw = raw.replace('```json', '').replace('```', '').strip()
 
-            # Tentar extrair apenas o JSON válido com regex
+            # Extrair JSON
             match = re.search(r'(\{.*\})', raw, re.DOTALL)
             if match:
                 raw = match.group(1)
             else:
-                # Fallback: remover caracteres não permitidos em JSON
                 raw = re.sub(r'[^\{\}\[\]":,0-9a-zA-Z_\-\. ]', '', raw)
 
-            logger.debug(f"Resposta após limpeza: {raw[:200]}...")
-
-            # ── VERIFICAR SE O JSON ESTÁ TRUNCADO ─────────────────────────────
+            # Verificar truncamento
             open_braces = raw.count('{')
             close_braces = raw.count('}')
             open_brackets = raw.count('[')
             close_brackets = raw.count(']')
-
-            is_truncated = False
             if open_braces > close_braces or open_brackets > close_brackets:
-                is_truncated = True
-                logger.warning(
-                    f"JSON truncado: {open_braces}x'{{' vs {close_braces}x'}}', "
-                    f"{open_brackets}x'[' vs {close_brackets}x']' — "
-                    f"tamanho={len(raw)} chars — "
-                    f"fim: ...{raw[-120:]!r}"
-                )
+                raw = repair_truncated_json(raw)
 
-            # ── RECUPERAR JSON TRUNCADO (FECHAR CHAVES/COLCHETES) ─────────────
-            if is_truncated:
-                raw = repair_truncated_json(raw)   # <-- chamada direta (mesmo ficheiro)
-                logger.debug(f"JSON reparado: {raw[:200]}...")
+            result = json.loads(raw)
 
-            try:
-                result = json.loads(raw)
-
-                if "characters" in result:
-                    valid_chars = {}
-                    for cid, cdata in result["characters"].items():
+            # Processar personagens existentes na resposta
+            if "characters" in result:
+                valid_chars = {}
+                for cid, cdata in result["characters"].items():
+                    if isinstance(cdata, dict):
                         cid_str = str(cid).strip().lower().replace(" ", "_")
-                        # Verificação rigorosa: cdata deve ser dict
-                        if isinstance(cdata, dict) and cdata:
-                            desc = cdata.get("description", "")
-                            if not desc.strip() or "voz" not in desc.lower():
-                                name = cdata.get("name", cid_str)
-                                if "jovem" in name.lower() or "rapaz" in name.lower():
-                                    desc = f"Voz jovem de {name}, português de Portugal, tom neutro"
-                                elif "velho" in name.lower() or "vagabundo" in name.lower():
-                                    desc = f"Voz madura de {name}, português de Portugal, tom neutro"
-                                elif "senhora" in name.lower() or "mulher" in name.lower() or "mãe" in name.lower():
-                                    desc = f"Voz feminina de {name}, português de Portugal, tom neutro"
-                                elif "senhor" in name.lower() or "homem" in name.lower() or "pai" in name.lower():
-                                    desc = f"Voz masculina de {name}, português de Portugal, tom neutro"
-                                else:
-                                    desc = f"Voz de {name}, português de Portugal, tom neutro"
-                                cdata["description"] = desc
-                            valid_chars[cid_str] = cdata
-                        else:
-                            # Se cdata não for dict, criar um dict básico
-                            logger.warning(f"cdata para {cid} não é dict: {type(cdata)}. A criar descrição padrão.")
-                            valid_chars[cid_str] = {
-                                "name": cid_str,
-                                "type": "character",
-                                "description": f"Voz de {cid_str}, português de Portugal, tom neutro"
-                            }
-                    result["characters"] = valid_chars
+                        if "name" not in cdata:
+                            cdata["name"] = cid_str
+                        if "description" not in cdata or not cdata["description"].strip():
+                            cdata["description"] = f"Voz de {cdata['name']}, português de Portugal, tom neutro."
+                        cdata["type"] = "character"
+                        valid_chars[cid_str] = cdata
+                result["characters"] = valid_chars
 
-                if "segments" in result:
-                    for seg in result["segments"]:
-                        if "character_id" not in seg or not seg["character_id"]:
-                            seg["character_id"] = "narrator"
-                        seg["character_id"] = str(seg["character_id"]).strip().lower().replace(" ", "_")
-                        if "emotion" in seg:
-                            seg["emotion"] = map_emotion(seg["emotion"])
-                        else:
-                            seg["emotion"] = "neutral"
-                        if "pace" not in seg:
-                            seg["pace"] = 1.0
-                        if "pause_ms" not in seg:
-                            seg["pause_ms"] = 0
+            # Processar segmentos
+            if "segments" in result:
+                for seg in result["segments"]:
+                    if "character_id" not in seg or not seg["character_id"]:
+                        seg["character_id"] = "narrator"
+                    seg["character_id"] = str(seg["character_id"]).strip().lower().replace(" ", "_")
+                    if "emotion" in seg:
+                        seg["emotion"] = map_emotion(seg["emotion"])
+                    else:
+                        seg["emotion"] = "neutral"
+                    if "pace" not in seg:
+                        seg["pace"] = 1.0
+                    if "pause_ms" not in seg:
+                        seg["pause_ms"] = 0
 
-                return result
+            return result
 
-            except json.JSONDecodeError as e:
-                logger.warning(f"JSON inválido (tentativa {attempt+1}/{max_retries+1}): {e}")
-                logger.warning(f"  início: {raw[:200]!r}")
-                logger.warning(f"  fim:    {raw[-200:]!r}")
-                if attempt < max_retries:
-                    # Aumentar num_predict e num_ctx para a próxima tentativa
-                    num_predict = min(num_predict * 2, 131072)
-                    num_ctx = min(num_ctx * 2, 65536)
-                    logger.warning(f"A aumentar num_predict para {num_predict} e num_ctx para {num_ctx} e a tentar novamente")
-                    continue
-                return {"characters": {}, "segments": []}
+        except json.JSONDecodeError as e:
+            logger.warning(f"JSON inválido (tentativa {attempt+1}/{max_retries+1}): {e}")
+            if attempt < max_retries:
+                num_predict = min(num_predict * 2, 131072)
+                num_ctx = min(num_ctx * 2, 65536)
+                logger.warning(f"A aumentar num_predict para {num_predict} e num_ctx para {num_ctx}")
+                continue
+            return {"segments": [], "characters": {}}
 
         except requests.exceptions.Timeout:
             if attempt < max_retries:
-                logger.warning(f"Timeout ({text_length} chars), tentativa {attempt + 1}/{max_retries + 1}")
+                logger.warning(f"Timeout, tentativa {attempt+1}/{max_retries+1}")
                 timeout = min(timeout * 1.5, 600)
-                # Aumentar também os limites de tokens
                 num_predict = min(num_predict * 2, 32768)
                 num_ctx = min(num_ctx * 2, 16384)
                 continue
-            return {"characters": {}, "segments": []}
+            return {"segments": [], "characters": {}}
 
         except Exception as e:
             logger.warning(f"Erro Ollama: {e}")
             if attempt < max_retries:
                 continue
-            return {"characters": {}, "segments": []}
+            return {"segments": [], "characters": {}}
 
-    return {"characters": {}, "segments": []}
+    return {"segments": [], "characters": {}}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 5. EXTRAÇÃO DE ALIASES
+# 6. EXTRAÇÃO DE ALIASES
 # ═══════════════════════════════════════════════════════════════════════════
 async def extract_aliases(
     ollama_url: str,
@@ -790,15 +738,10 @@ async def extract_aliases(
     max_retries: int = 2,
     user_settings: Optional[Dict[str, Any]] = None
 ) -> Dict[str, List[str]]:
-    """
-    Extrai aliases (apelidos/termos alternativos) para cada personagem.
-    Agora com timeout baseado nas definições do utilizador.
-    """
     char_list = []
     for cid, c in characters.items():
         if cid == "narrator":
             continue
-        # Verificar se c é dict antes de aceder
         if isinstance(c, dict):
             name = c.get("name", cid)
         else:
@@ -810,8 +753,6 @@ async def extract_aliases(
         return {}
 
     char_text = "\n".join(char_list)
-
-    # ── DEFINIR TIMEOUT COM BASE NAS DEFINIÇÕES DO UTILIZADOR ──────────────
     timeout = user_settings.get("ollama_timeout_medium", 120) if user_settings else 120
 
     prompt = f"""Dado o texto de um livro e a lista de personagens,
@@ -824,10 +765,10 @@ REGRAS:
 1. Inclui nomes próprios, títulos (Sr., Sra., etc.), graus de parentesco (pai, mãe, filho, etc.), profissões, e qualquer outra palavra que a personagem seja chamada no texto.
 2. Mantém os termos em minúsculas.
 3. Para cada personagem, lista apenas termos que aparecem no texto fornecido.
-4. Inclui também termos como "o pai", "a mãe", "o senhor", "a senhora", "o vagabundo" se aparecerem.
-5. Para personagens sem nome próprio (ex: "vagabundo", "jovem_empregado"), inclui termos como "o vagabundo", "um vagabundo", "o homem", etc., se aparecerem no texto.
+4. Inclui também termos como "o pai", "a mãe", "o senhor", "a senhora", se aparecerem.
+5. Para personagens sem nome próprio (ex: id "vagabundo" ou "jovem_empregado"), inclui termos como "o vagabundo", "um vagabundo", "o homem", etc., se aparecerem no texto.
 6. Responde APENAS com JSON válido no formato:
-   {{"asa_griffiths": ["pai", "o pai", "asa"], "elvira_griffiths": ["mãe", "a mãe", ...], "vagabundo": ["o vagabundo", "um vagabundo", "homem"]}}
+   {{"<character_id_1>": ["nome_proprio", "alcunha"], "<character_id_2>": ["pai", "o pai"], ...}}
 
 TEXTO (primeiros 5000 caracteres para contexto):
 {full_text[:5000]}
@@ -842,7 +783,6 @@ JSON:"""
         }
     }
 
-    # ── LOOP DE TENTATIVAS ──────────────────────────────────────────────────
     for attempt in range(max_retries + 1):
         try:
             def _make_request():
@@ -851,7 +791,7 @@ JSON:"""
                     "prompt": prompt,
                     "format": json_schema,
                     "stream": False,
-                    "keep_alive": -1,      # mantém o modelo em memória após a resposta
+                    "keep_alive": -1,
                     "options": {
                         "temperature": 0.1,
                         "top_k": 10,
@@ -885,31 +825,27 @@ JSON:"""
                 else:
                     logger.warning(f"Resposta de aliases não é dict: {type(result)}")
                     return {}
-
             except json.JSONDecodeError:
                 if attempt < max_retries:
-                    logger.warning(f"JSON de aliases inválido, tentativa {attempt + 1}/{max_retries + 1}")
+                    logger.warning(f"JSON de aliases inválido, tentativa {attempt+1}/{max_retries+1}")
                     continue
                 return {}
-
         except requests.exceptions.Timeout:
             if attempt < max_retries:
-                logger.warning(f"Timeout na extração de aliases, tentativa {attempt + 1}/{max_retries + 1}")
+                logger.warning(f"Timeout na extração de aliases, tentativa {attempt+1}/{max_retries+1}")
                 timeout = min(timeout * 1.5, 600)
                 continue
             return {}
-
         except Exception as e:
             logger.warning(f"Erro na extração de aliases: {e}")
             if attempt < max_retries:
                 continue
             return {}
-
     return {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 6. MAPEADOR DE TERMOS GENÉRICOS
+# 7. MAPEADOR DE TERMOS GENÉRICOS
 # ═══════════════════════════════════════════════════════════════════════════
 class NameMapper:
     def __init__(self, aliases: Optional[Dict[str, List[str]]] = None):
@@ -931,14 +867,11 @@ class NameMapper:
 
     def map_generic(self, term: str, context: str = "") -> str:
         term_lower = term.lower().strip()
-        # 1. correspondência exata
         if term_lower in self._reverse_map:
             return self._reverse_map[term_lower]
-        # 2. correspondência parcial
         for alias, cid in self._reverse_map.items():
             if term_lower in alias or alias in term_lower:
                 return cid
-        # 3. procurar no contexto
         if context:
             for cid, terms in self.aliases.items():
                 for alias in terms:
@@ -950,7 +883,6 @@ class NameMapper:
                 for cid, terms in self.aliases.items():
                     if name in [t.lower() for t in terms] or name in cid:
                         return cid
-        # 4. termos de parentesco
         if term_lower in ["pai", "mãe", "mae", "pais", "filho", "filha", "irmão", "irmã"]:
             for cid, terms in self.aliases.items():
                 for alias in terms:
@@ -969,14 +901,13 @@ class NameMapper:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 7. RESOLVER IDs GENÉRICOS NOS SEGMENTOS
+# 8. RESOLVER IDs GENÉRICOS NOS SEGMENTOS
 # ═══════════════════════════════════════════════════════════════════════════
 def resolve_generic_ids(
     segments: List[Dict[str, Any]],
     characters: Dict[str, Any],
     aliases: Dict[str, List[str]]
 ) -> List[Dict[str, Any]]:
-
     if not aliases:
         return segments
 

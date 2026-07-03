@@ -32,7 +32,8 @@ from core.ollama_analyzer import (
     split_into_blocks, sanitize_segments,
     analyze_block, extract_aliases,
     NameMapper, resolve_generic_ids,
-    map_emotion
+    map_emotion,
+    extract_characters_from_text  # <-- NOVA FUNÇÃO ADICIONADA
 )
 from core.post_processor import post_process_analysis_universal
 from tts.engine import TTSEngine
@@ -521,7 +522,7 @@ class AudiobookApp(ctk.CTk):
         char_map = {cid: cdata.get("name", "").lower() for cid, cdata in self.characters.items()}
         name_to_id = {v: k for k, v in char_map.items() if v}
 
-        # Procurar padrões como "disse Asa" ou "Asa disse"
+        # Procurar padrões como "disse <Nome>" ou "<Nome> disse" (qualquer personagem conhecida)
         for cid, cdata in self.characters.items():
             if cid == "narrator":
                 continue
@@ -696,11 +697,6 @@ class AudiobookApp(ctk.CTk):
             max_block = 25000
 
         # ── BATCH_SIZE ─────────────────────────────────────────────────────────
-        # ATENÇÃO: o Ollama processa pedidos sequencialmente (single-threaded).
-        # Um batch_size > 1 não acelera — os pedidos ficam em fila e o timeout
-        # começa a contar desde o início, garantindo falhas nos últimos do batch.
-        # Para blocos grandes (>4000 chars): forçar batch_size=1.
-        # Para blocos pequenos: permitir no máximo 2.
         user_batch_size = self.user_settings.get("ollama_batch_size", 1)
         if max_block > 4000:
             batch_size = 1
@@ -718,18 +714,37 @@ class AudiobookApp(ctk.CTk):
             blocks = blocks[:50]
             self.log(f"✅ Limitado a {len(blocks)} blocos.")
 
-        # 2. LOOP DE ANÁLISE
-        all_characters, all_segments = {}, []
+        # ══════════════════════════════════════════════════════════════════════
+        # FASE 1: EXTRAÇÃO DE PERSONAGENS (NOVO)
+        # ══════════════════════════════════════════════════════════════════════
+        self.log("🔎 FASE 1 – A extrair todas as personagens do livro...")
+        all_characters = await extract_characters_from_text(
+            self.ollama_url,
+            self.model_name,
+            self.raw_text,
+            user_settings=self.user_settings
+        )
+        # Garantir que o narrador existe
+        if "narrator" not in all_characters:
+            all_characters["narrator"] = DEFAULT_NARRATOR.copy()
+        self.log(f"✅ Fase 1 concluída: {len(all_characters)} personagens encontradas.")
 
-        for i in range(0, len(blocks), batch_size):
+        # ══════════════════════════════════════════════════════════════════════
+        # FASE 2: SEGMENTAÇÃO COM ELENCO CONHECIDO (NOVO)
+        # ══════════════════════════════════════════════════════════════════════
+        self.log("📝 FASE 2 – A segmentar com o elenco conhecido...")
+        all_segments = []
+        total_blocks = len(blocks)
+
+        for i in range(0, total_blocks, batch_size):
             batch = blocks[i:i + batch_size]
             batch_tasks = []
 
             for j, block in enumerate(batch):
                 block_index = i + j
-                self.set_progress(0.1 + 0.6 * (block_index / len(blocks)),
-                                f"Analisando bloco {block_index+1}/{len(blocks)}...")
-                self.log(f"🔍 Bloco {block_index+1}/{len(blocks)} ({len(block)} chars)...")
+                self.set_progress(0.1 + 0.6 * (block_index / total_blocks),
+                                f"Segmentando bloco {block_index+1}/{total_blocks}...")
+                self.log(f"🔍 Bloco {block_index+1}/{total_blocks} ({len(block)} chars)...")
                 context = "\n".join(blocks[max(0, block_index-1):block_index])
 
                 task = analyze_block(
@@ -737,8 +752,8 @@ class AudiobookApp(ctk.CTk):
                     self.model_name,
                     block,
                     context,
-                    all_characters,
-                    self.aliases,
+                    known_characters=all_characters,  # <-- PASSAR ELENCO
+                    aliases=self.aliases,             # <-- PASSAR ALIASES
                     user_settings=self.user_settings
                 )
                 batch_tasks.append((block_index, task))
@@ -750,28 +765,22 @@ class AudiobookApp(ctk.CTk):
                     self.log(f"⚠️ Erro no bloco {block_index+1}: {result}")
                     continue
                 if result and isinstance(result, dict):
-                    raw_chars = result.get("characters", {})
-                    if isinstance(raw_chars, dict):
-                        for cid, cdata in raw_chars.items():
-                            cid = str(cid).strip().lower().replace(" ", "_")
-                            if cid and cid not in all_characters:
+                    # Adicionar novas personagens que o modelo tenha descoberto
+                    if "characters" in result:
+                        for cid, cdata in result["characters"].items():
+                            if cid not in all_characters:
+                                self.log(f"   ✨ Nova personagem detetada: {cid}")
                                 all_characters[cid] = cdata
+                    if "segments" in result:
+                        all_segments.extend(result["segments"])
 
-                    raw_segs = result.get("segments", [])
-                    block_len = len(blocks[block_index])
-                    n_segs = len(raw_segs) if isinstance(raw_segs, list) else 0
-                    # Alertar se o Ollama devolveu poucos segmentos para o tamanho do bloco
-                    # (heurística: esperamos ≥1 segmento por 500 chars)
-                    expected_min = max(1, block_len // 500)
-                    if n_segs < expected_min:
-                        self.log(f"   ⚠️ Bloco {block_index+1}: apenas {n_segs} segmento(s) para {block_len} chars (esperado ≥{expected_min}). Possível timeout/truncamento.")
-                    else:
-                        self.log(f"   ✅ Bloco {block_index+1}: {n_segs} segmentos extraídos.")
+        # Atualizar os atributos principais da classe
+        self.characters = all_characters
+        self.segments = all_segments
 
-                    if isinstance(raw_segs, list):
-                        all_segments.extend(raw_segs)
-
-        # 3. SANITIZAÇÃO
+        # ══════════════════════════════════════════════════════════════════════
+        # 3. SANITIZAÇÃO (CONTINUAÇÃO DO PÓS-PROCESSAMENTO ORIGINAL)
+        # ══════════════════════════════════════════════════════════════════════
         self.log("🧹 A sanitizar segmentos...")
         all_segments = sanitize_segments(all_segments)
 
@@ -820,10 +829,6 @@ class AudiobookApp(ctk.CTk):
         self.segments = self._smart_segment_splitter(self.segments)
 
         # 10. DEDUPLICAÇÃO DE SEGMENTOS
-        # Usar apenas o texto como chave mas permitir repetições que estejam
-        # separadas por mais de 3 segmentos (frases que se repetem no livro são válidas).
-        # O que queremos evitar é o mesmo segmento ser emitido duas vezes consecutivas
-        # pelo Ollama (artefacto de geração), não frases repetidas no texto original.
         unique_segments = []
         recent_texts = []   # janela deslizante dos últimos 5 textos
         for seg in self.segments:
@@ -835,7 +840,6 @@ class AudiobookApp(ctk.CTk):
                 recent_texts.append(text)
                 if len(recent_texts) > 5:
                     recent_texts.pop(0)
-            # Se o texto já apareceu recentemente (duplicado consecutivo), ignorar
         removed = len(self.segments) - len(unique_segments)
         self.segments = unique_segments
         self.log(f"   🧹 Segmentos únicos: {len(self.segments)} ({removed} duplicados consecutivos removidos)")
