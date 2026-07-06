@@ -1,8 +1,65 @@
 # core/post_processor.py
+import re
 import logging
 from typing import Dict, List, Any, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def fix_narration_misattributed_as_speech(
+    characters: Dict[str, Dict[str, Any]],
+    segments: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Deteta e corrige segmentos onde NARRAÇÃO sobre uma personagem foi
+    incorretamente atribuída como sendo a FALA dessa personagem.
+
+    Exemplo real encontrado: um segmento com o texto "E então Burton Burleigh
+    concluiu que talvez não tivesse sido o tripé..." (frase em 3ª pessoa,
+    claramente a descrever o raciocínio de Burton Burleigh, não uma citação
+    dele) foi atribuído a character_id="burton_burleigh" como se fosse a
+    sua própria fala direta.
+
+    Heurística (conservadora, para evitar falsos positivos):
+    Só reclassifica para "narrator" se AMBAS as condições se verificarem:
+    1. O nome completo da personagem (≥2 palavras) aparece literalmente
+       dentro do próprio texto do segmento.
+    2. O segmento NÃO contém nenhum marcador típico de discurso direto em
+       PT-PT (aspas, aspas angulares, travessão de diálogo).
+    A ausência de qualquer marcador de diálogo, combinada com a presença do
+    próprio nome da personagem no texto, é o sinal de que se trata de uma
+    frase narrativa sobre a personagem, não dita por ela.
+    """
+    dialogue_markers = re.compile(r'["“”«»]|—')
+    fixed_count = 0
+
+    for seg in segments:
+        cid = seg.get("character_id")
+        if not cid or cid == "narrator":
+            continue
+        cdata = characters.get(cid)
+        if not isinstance(cdata, dict):
+            continue
+        name = cdata.get("name", "").strip()
+        if not name or len(name.split()) < 2:
+            continue  # nome de uma só palavra é demasiado ambíguo para esta verificação
+
+        text = seg.get("text", "")
+        if not text:
+            continue
+
+        if name.lower() in text.lower() and not dialogue_markers.search(text):
+            seg["character_id"] = "narrator"
+            fixed_count += 1
+
+    if fixed_count:
+        logger.info(
+            f"🧹 {fixed_count} segmento(s) de narração indevidamente atribuídos "
+            f"a uma personagem foram repostos para 'narrator'."
+        )
+
+    return segments
+
 
 def clean_character_descriptions(characters: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """Melhora descrições para serem úteis ao TTS. Substitui descrições não vocais.
@@ -120,6 +177,7 @@ def post_process_analysis_universal(
         characters = clean_character_descriptions(characters)
     if merge_duplicates:
         characters, segments = merge_duplicate_characters(characters, segments)
+    segments = fix_narration_misattributed_as_speech(characters, segments)
     used_ids = {seg.get("character_id") for seg in segments if seg.get("character_id")}
     removed_chars = [cid for cid in characters if cid != "narrator" and cid not in used_ids]
     for cid in removed_chars:

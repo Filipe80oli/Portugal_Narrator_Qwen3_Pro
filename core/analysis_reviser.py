@@ -1,5 +1,6 @@
 # core/analysis_reviser.py
 import re
+import json
 import logging
 import requests
 from typing import Dict, List, Tuple, Set
@@ -42,6 +43,111 @@ Responde apenas com o nome exato da personagem (como está na lista) ou "narrato
     return prompt
 
 
+def build_speaker_prompt_batch(items: List[Tuple[int, str]], character_names: List[str]) -> str:
+    """
+    Constrói um único prompt que pede ao modelo para identificar o falante
+    de VÁRIOS excertos de uma só vez, em vez de um pedido por segmento.
+
+    Otimização de desempenho: cada pedido ao Ollama tem overhead fixo
+    (processamento de prompt, arranque de geração) independentemente do
+    tamanho do texto. Agrupar N segmentos num único pedido reduz N
+    round-trips sequenciais para 1, o que é a diferença entre, por exemplo,
+    19 pedidos de ~10-15s cada (~3-5 min) e 2-3 pedidos (~30-60s no total).
+    """
+    names_list = ", ".join(character_names)
+    excerpt_lines = []
+    for local_idx, text in items:
+        snippet = text if len(text) <= 500 else text[:500] + "..."
+        excerpt_lines.append(f'{local_idx}. "{snippet}"')
+    excerpts_block = "\n".join(excerpt_lines)
+
+    prompt = f"""Dado o seguinte livro, identifica qual personagem está a falar em CADA excerto numerado (discurso direto).
+A lista de personagens é: {names_list}.
+Se um excerto não tiver um falante claro ou for narração, usa "narrator".
+
+EXCERTOS:
+{excerpts_block}
+
+Responde APENAS com JSON válido no formato:
+{{"respostas": [{{"id": <número>, "falante": "<nome_exato_ou_narrator>"}}, ...]}}
+Inclui uma entrada para CADA excerto numerado acima, na mesma ordem."""
+    return prompt
+
+
+def get_ollama_response_batch(
+    prompt: str, ollama_url: str, model_name: str, n_items: int, timeout: int = 120
+) -> Dict[int, str]:
+    """
+    Envia o prompt em lote e devolve um dict {id_local: falante}.
+    Em caso de falha (timeout, JSON inválido), devolve dict vazio —
+    o chamador trata isso como "sem correções para este lote" em vez
+    de rebentar, preservando o comportamento anterior de fail-soft.
+    """
+    json_schema = {
+        "type": "object",
+        "properties": {"respostas": {"type": "array"}},
+        "required": ["respostas"]
+    }
+    try:
+        resp = requests.post(
+            f"{ollama_url}/api/generate",
+            json={
+                "model": model_name,
+                "prompt": prompt,
+                "format": json_schema,
+                "stream": False,
+                "keep_alive": -1,
+                "options": {
+                    "temperature": 0.0,
+                    "num_ctx": 8192,
+                    "num_predict": max(512, n_items * 40),
+                }
+            },
+            timeout=timeout
+        )
+        if resp.status_code != 200:
+            return {}
+        raw = resp.json().get("response", "").strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        data = json.loads(raw)
+        results = {}
+        for item in data.get("respostas", []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                local_id = int(item.get("id"))
+            except (TypeError, ValueError):
+                continue
+            falante = str(item.get("falante", "")).strip()
+            if falante:
+                results[local_id] = falante
+        return results
+    except Exception as e:
+        logger.debug(f"Falha na revisão em lote: {e}")
+        return {}
+
+
+def _normalize_for_comparison(text: str) -> str:
+    """
+    Normaliza texto para comparação tolerante a diferenças tipográficas.
+
+    BUG CORRIGIDO: find_missing_text comparava o texto original do livro
+    (que normalmente usa aspas curvas “ ” ‘ ’) com o texto dos segmentos
+    devolvidos pelo Ollama (que frequentemente usa aspas retas " ' ou tem
+    espaçamento ligeiramente diferente à volta da pontuação). Isto fazia
+    com que diálogos genuinamente presentes nos segmentos fossem reportados
+    como "texto em falta" — falsos positivos. Esta normalização converte
+    aspas tipográficas para retas e colapsa espaços antes de comparar,
+    tal como já é feito em core.text_normalizer.normalize_text.
+    """
+    if not text:
+        return ""
+    text = text.replace('\u201c', '"').replace('\u201d', '"')
+    text = text.replace('\u2018', "'").replace('\u2019', "'")
+    text = " ".join(text.split())
+    return text
+
+
 def find_missing_text(
     original_text: str,
     segments: List[dict],
@@ -59,6 +165,7 @@ def find_missing_text(
       Movido para FORA do loop seg_text, percorrendo segment_texts independentemente.
     - Bug 4: o limiar de 60% dividia por len(sentences) que inclui frases curtas
       ignoradas pelo `if len(sent) < 30`. Agora divide pelo número de frases longas.
+    - Bug 5: comparação não tolerava aspas curvas vs retas — ver _normalize_for_comparison.
     """
     if log_fn is None:
         log_fn = logger.info
@@ -68,7 +175,7 @@ def find_missing_text(
     for seg in segments:
         text = seg.get("text", "").strip()
         if text:
-            segment_texts.add(" ".join(text.split()))
+            segment_texts.add(_normalize_for_comparison(text))
 
     # 2. Dividir o texto original em parágrafos
     paragraphs = [p.strip() for p in re.split(r'\n\s*\n', original_text) if p.strip()]
@@ -78,7 +185,7 @@ def find_missing_text(
         if len(para) < min_chars:
             continue
 
-        normalized_para = " ".join(para.split())
+        normalized_para = _normalize_for_comparison(para)
         found = False
 
         # Verificação exacta: parágrafo contido num segmento ou vice-versa
@@ -95,7 +202,7 @@ def find_missing_text(
             if long_sentences:
                 matched = 0
                 for sent in long_sentences:
-                    normalized_sent = " ".join(sent.split())
+                    normalized_sent = _normalize_for_comparison(sent)
                     for seg_text in segment_texts:
                         if normalized_sent in seg_text or seg_text in normalized_sent:
                             matched += 1
@@ -168,35 +275,62 @@ def revise_analysis(
 
     corrections: Dict[int, str] = {}
     ollama_url = ollama_base_url.rstrip("/")
+    names = [
+        cdata["name"]
+        for cdata in characters.values()
+        if isinstance(cdata, dict) and cdata.get("name")
+    ]
 
-    for idx, seg in candidates:
-        text = seg.get("text", "")
-        current_id = seg.get("character_id", "narrator")
-        names = [
-            cdata["name"]
-            for cdata in characters.values()
-            if isinstance(cdata, dict) and cdata.get("name")
-        ]
-        prompt = build_speaker_prompt(text, names)
-        resposta = get_ollama_response(prompt, ollama_url, model_name)
+    # ── REVISÃO EM LOTE ──────────────────────────────────────────────────
+    # Em vez de 1 pedido ao Ollama por segmento (N round-trips sequenciais,
+    # cada um com overhead fixo de processamento de prompt), agrupamos
+    # BATCH_SIZE segmentos por pedido. Para 19 segmentos isto passa de
+    # 19 pedidos para ~3, reduzindo o tempo total de vários minutos para
+    # dezenas de segundos.
+    BATCH_SIZE = 8
+    batches = [candidates[i:i + BATCH_SIZE] for i in range(0, len(candidates), BATCH_SIZE)]
 
-        if not resposta:
-            continue
+    for batch_num, batch in enumerate(batches):
+        items = [(local_i, seg.get("text", "")) for local_i, (idx, seg) in enumerate(batch)]
+        prompt = build_speaker_prompt_batch(items, names)
+        batch_results = get_ollama_response_batch(
+            prompt, ollama_url, model_name, n_items=len(batch)
+        )
 
-        resposta_clean = resposta.strip().lower()
-        if resposta_clean in ("narrator", "narrador", "narradora"):
-            suggested_id = "narrator"
-        else:
-            suggested_id = name_to_id.get(resposta_clean)
-            if not suggested_id:
-                for nome, cid in name_to_id.items():
-                    if resposta_clean in nome or nome in resposta_clean:
-                        suggested_id = cid
-                        break
+        # Fallback: se o lote falhou (dict vazio) ou veio incompleto,
+        # processar individualmente apenas os que faltaram — preserva
+        # a robustez do comportamento anterior sem perder a vantagem de
+        # velocidade nos casos (normais) em que o lote funciona.
+        missing_local_ids = [i for i in range(len(batch)) if i not in batch_results]
+        for local_i in missing_local_ids:
+            idx, seg = batch[local_i]
+            text = seg.get("text", "")
+            prompt_single = build_speaker_prompt(text, names)
+            resposta = get_ollama_response(prompt_single, ollama_url, model_name)
+            if resposta:
+                batch_results[local_i] = resposta
 
-        if suggested_id and suggested_id != current_id:
-            log_fn(f"   ✏️ Segmento {idx}: '{current_id}' → '{suggested_id}' (modelo sugeriu '{resposta}')")
-            corrections[idx] = suggested_id
+        for local_i, (idx, seg) in enumerate(batch):
+            resposta = batch_results.get(local_i)
+            if not resposta:
+                continue
+            current_id = seg.get("character_id", "narrator")
+            resposta_clean = resposta.strip().lower()
+            if resposta_clean in ("narrator", "narrador", "narradora"):
+                suggested_id = "narrator"
+            else:
+                suggested_id = name_to_id.get(resposta_clean)
+                if not suggested_id:
+                    for nome, cid in name_to_id.items():
+                        if resposta_clean in nome or nome in resposta_clean:
+                            suggested_id = cid
+                            break
+
+            if suggested_id and suggested_id != current_id:
+                log_fn(f"   ✏️ Segmento {idx}: '{current_id}' → '{suggested_id}' (modelo sugeriu '{resposta}')")
+                corrections[idx] = suggested_id
+
+        log_fn(f"   📦 Lote {batch_num + 1}/{len(batches)} processado ({len(batch)} segmentos).")
 
     for idx, new_id in corrections.items():
         segments[idx]["character_id"] = new_id

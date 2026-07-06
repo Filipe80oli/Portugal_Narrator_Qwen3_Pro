@@ -3,13 +3,14 @@
   "ollama_timeout_small": 300,
   "ollama_timeout_medium": 600,
   "ollama_timeout_large": 900,
-  "ollama_warmup_timeout": 300,
+  "ollama_warmup_timeout": 600,
   "ollama_temperature": 0.1,
   "ollama_num_predict": 8192,
   "tts_pace_default": 1.0,
   "tts_max_retries": 4,
-  "ollama_model": "gemma3:27b",
+  "ollama_model": "qwen3:32b",
   "ollama_batch_size": 4,
   "auto_revise": 1,
-  "test_mode": 1
+  "test_mode": 0,
+  "ollama_model_phase1": "qwen3:32b"
 }
