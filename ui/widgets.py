@@ -114,6 +114,15 @@ def build_action_section(app):
     )
     app.btn_generate.pack(side="left", padx=5, expand=True, fill="x")
 
+    # ✅ BOTÃO STOP
+    app.btn_stop = ctk.CTkButton(
+        action_frame, text="⏹️ PARAR",
+        command=app.stop_generation, fg_color="#e74c3c", height=50,
+        font=("Roboto", 14, "bold"), state="disabled"
+    )
+    app.btn_stop.pack(side="left", padx=5, expand=True, fill="x")
+
+
 
 def build_character_section(app):
     ctk.CTkLabel(app, text="🎭 Personagens Detetados & Configuração de Voz",
