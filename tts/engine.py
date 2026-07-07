@@ -11,6 +11,7 @@ import logging
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 import torch
+import json
 import numpy as np
 import soundfile as sf
 from config.settings import (
@@ -134,6 +135,33 @@ class TTSEngine:
                 if self.is_segment_cached(i, seg["text"]):
                     count += 1
         return count
+    
+    def save_segment_metadata(self, seg_index: int, text: str, audio_path: str, success: bool, details: str = ""):
+        """Guarda metadados de geração do segmento para cache/debug."""
+        from datetime import datetime
+        meta_file = self.temp_dir / "segment_metadata.json"
+        
+        data = {}
+        if meta_file.exists():
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+                
+        # Trunca texto muito longo para não inflacionar o JSON
+        short_text = text[:120] + "..." if len(text) > 120 else text
+        
+        data[str(seg_index)] = {
+            "text": short_text,
+            "audio_path": str(audio_path),
+            "success": success,
+            "details": details,
+            "generated_at": datetime.now().isoformat()
+        }
+        
+        with open(meta_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Âncoras PT-PT
@@ -171,6 +199,13 @@ class TTSEngine:
                     continue
 
                 q = validate_audio(anchor_path, ANCHOR_TEXT)
+                
+                # ── ADICIONAR LIMITE DE 390KB SÓ PARA ÂNCORAS AQUI ──
+                if q.ok and Path(anchor_path).stat().st_size > 390 * 1024:
+                    self.log(f"   ⚠️ [{attempt}] Âncora gerada é demasiado grande (>390KB). A rejeitar...")
+                    Path(anchor_path).unlink(missing_ok=True)
+                    continue # Vai para a próxima tentativa       
+
                 if q.ok:
                     self.log(f"   ✅ Âncora OK [{cid}]: dur={q.duration:.1f}s "
                              f"rms={q.rms:.4f} zcr={q.zcr:.4f}")

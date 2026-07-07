@@ -52,21 +52,22 @@ class AudioQuality:
 
 def validate_audio(wav_path: str, text: str) -> AudioQuality:
     path = Path(wav_path)
-
+    
+    # 1. Verificação de ficheiro vazio ou demasiado pequeno
     if not path.exists() or path.stat().st_size < 1024:
         return AudioQuality(False, "ficheiro_vazio_ou_ausente")
-
+    
     try:
         audio, sr = sf.read(str(path), dtype='float32', always_2d=False)
     except Exception as e:
         return AudioQuality(False, f"erro_leitura:{e}")
-
+        
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
-
+        
     n_samples = len(audio)
     duration  = n_samples / sr
-
+    
     # ── 1. Duração mínima ─────────────────────────────────────────────────────
     expected_min = max(1.0, len(text) / TTS_CHARS_PER_SECOND * TTS_MIN_DURATION_RATIO)
     if duration < expected_min:

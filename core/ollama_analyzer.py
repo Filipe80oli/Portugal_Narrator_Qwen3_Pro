@@ -678,7 +678,7 @@ Responde APENAS com JSON válido:
                     # por vezes inclui-as na mesma, confessando isso na própria
                     # descrição (ex: "(mencionado mas sem diálogo direto)").
                     # Rejeitar estes casos aqui, de forma programática.
-                    desc_check = cdata.get("description", "")
+                    desc_check = str(cdata.get("description", ""))  # <-- FORÇAR STRING
                     if _no_direct_speech_pattern.search(desc_check):
                         logger.debug(f"  Bloco {i+1}: candidato '{cid}' rejeitado (descrição admite ausência de discurso direto).")
                         continue
@@ -698,7 +698,7 @@ Responde APENAS com JSON válido:
                             all_characters[cid]["description"] = new_desc
                     else:
                         # Garantir descrição de voz mínima
-                        desc = cdata.get("description", "")
+                        desc = str(cdata.get("description", ""))  # <-- FORÇAR STRING
                         if not desc or "voz" not in desc.lower():
                             name = cdata.get("name", cid)
                             cdata["description"] = f"Voz neutra, português de Portugal, tom neutro. ({name})"
