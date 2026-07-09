@@ -11,6 +11,7 @@ import threading
 import logging
 import subprocess
 import sys
+from pymupdf.mupdf import cdata
 import requests
 from pathlib import Path
 from datetime import datetime

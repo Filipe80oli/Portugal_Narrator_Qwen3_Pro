@@ -8,7 +8,7 @@
   "ollama_num_predict": 8192,
   "tts_pace_default": 1.0,
   "tts_max_retries": 4,
-  "ollama_model": "gemma4:26b-gpu",
+  "ollama_model": "qwen3:32b",
   "ollama_batch_size": 4,
   "auto_revise": 1,
   "test_mode": 0,

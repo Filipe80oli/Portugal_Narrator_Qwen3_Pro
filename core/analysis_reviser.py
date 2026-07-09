@@ -45,32 +45,37 @@ Responde apenas com o nome exato da personagem (como está na lista) ou "narrato
 
 def build_speaker_prompt_batch(items: List[Tuple[int, str]], character_names: List[str]) -> str:
     """
-    Constrói um único prompt que pede ao modelo para identificar o falante
-    de VÁRIOS excertos de uma só vez, em vez de um pedido por segmento.
-
-    Otimização de desempenho: cada pedido ao Ollama tem overhead fixo
-    (processamento de prompt, arranque de geração) independentemente do
-    tamanho do texto. Agrupar N segmentos num único pedido reduz N
-    round-trips sequenciais para 1, o que é a diferença entre, por exemplo,
-    19 pedidos de ~10-15s cada (~3-5 min) e 2-3 pedidos (~30-60s no total).
+    Constrói um prompt em lote. Funciona tanto para livros clássicos 
+    (diálogos embutidos) como contemporâneos (diálogos limpos).
     """
     names_list = ", ".join(character_names)
     excerpt_lines = []
+    
     for local_idx, text in items:
-        snippet = text if len(text) <= 500 else text[:500] + "..."
+        # Aumentámos o limite para 800 chars para apanhar parágrafos clássicos inteiros
+        snippet = text if len(text) <= 800 else text[:800] + "..."
         excerpt_lines.append(f'{local_idx}. "{snippet}"')
+        
     excerpts_block = "\n".join(excerpt_lines)
-
+    
+    # PROMPT UNIVERSAL (Clássicos + Contemporâneos)
     prompt = f"""Dado o seguinte livro, identifica qual personagem está a falar em CADA excerto numerado (discurso direto).
 A lista de personagens é: {names_list}.
-Se um excerto não tiver um falante claro ou for narração, usa "narrator".
+
+⚠️ REGRAS DE OURO (Aplicar a todos os excertos):
+1. NARRAÇÃO vs DIÁLOGO: Se o excerto for apenas narração, descrição de cenário, ou pensamento interno sem aspas/travessão, usa "narrator".
+2. DIÁLOGOS LIMPOS (Contemporâneos): Se o excerto for uma fala direta óbvia, identifica a personagem pelo contexto ou nomes próprios.
+3. DIÁLOGOS EMBUTIDOS (Clássicos): Se o diálogo estiver "escondido" no meio de um parágrafo do narrador (ex: "Ele olhou para o céu, 'que belo dia', pensou ele..."), analisa as pistas contextuais (verbos dicendi como "disse ele", "perguntou ela", "exclamou a diretora") para encontrar o falante correto.
+4. ASPAS FALSAS: Se as aspas envolverem apenas uma palavra para ironia ou conceito (ex: "Ele era um 'génio'"), considera como "narrator".
+5. Se não houver um falante claro e inequívoco, usa "narrator".
 
 EXCERTOS:
 {excerpts_block}
 
 Responde APENAS com JSON válido no formato:
-{{"respostas": [{{"id": <número>, "falante": "<nome_exato_ou_narrator>"}}, ...]}}
-Inclui uma entrada para CADA excerto numerado acima, na mesma ordem."""
+{{ "respostas": [{{ "id": <número>, "falante": "<nome_exato_ou_narrator>" }}, ...]}}
+Inclui uma entrada para CADA excerto numerado acima, na mesma ordem.
+"""
     return prompt
 
 

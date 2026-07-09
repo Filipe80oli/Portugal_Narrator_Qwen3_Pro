@@ -6,6 +6,7 @@ Correções: aumento de num_predict/num_ctx, recuperação de JSON truncado,
 verificação de tipo para evitar "str" object does not support item assignment.
 """
 import re
+import time
 import json
 import logging
 import asyncio
@@ -293,8 +294,14 @@ def split_into_blocks(text: str, max_chars: int = MAX_BLOCK_SIZE) -> List[str]:
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
     blocks = []
     current_block = ""
+    
     for para in paragraphs:
-        if len(para) > max_chars:
+        # SE O PARÁGRAFO TEM DIÁLOGO (ASPAS OU TRAVESSÃO), NÃO O DIVIDIR!
+        # Forçar o modelo a ver o parágrafo inteiro para entender o contexto.
+        has_dialogue = bool(re.search(r'["«»—]', para))
+        
+        if len(para) > max_chars and not has_dialogue:
+            # Só divide parágrafos longos que NÃO sejam diálogo
             if current_block:
                 blocks.append(current_block)
                 current_block = ""
@@ -306,11 +313,13 @@ def split_into_blocks(text: str, max_chars: int = MAX_BLOCK_SIZE) -> List[str]:
                 else:
                     current_block += (" " + sentence if current_block else sentence)
         else:
+            # Parágrafos de diálogo (mesmo que gigantes) vão inteiros ou agrupados
             if len(current_block) + len(para) + 2 > max_chars and current_block:
                 blocks.append(current_block)
                 current_block = para
             else:
                 current_block += ("\n\n" + para if current_block else para)
+                
     if current_block:
         blocks.append(current_block)
     return blocks
@@ -484,6 +493,8 @@ async def discover_characters(
         start = end - overlap
 
     logger.info(f"🔎 Fase 1 — Descoberta de personagens em {len(chunks)} blocos...")
+    start_phase1 = time.time()
+    logger.info(f"🔎 Fase 1 — Início: {time.strftime('%H:%M:%S')}")
 
     generic_terms_seen: set = set()  # termos de papel/parentesco vistos mas não persistidos
 
@@ -692,15 +703,15 @@ Responde APENAS com JSON válido:
 
                     # Manter a descrição mais rica se a personagem já existe
                     if cid in all_characters:
-                        existing_desc = all_characters[cid].get("description", "")
-                        new_desc = cdata.get("description", "")
+                        existing_desc = str(all_characters[cid].get("description", ""))  # <-- FORÇAR STRING
+                        new_desc = str(cdata.get("description", ""))                     # <-- FORÇAR STRING
                         if len(new_desc) > len(existing_desc):
                             all_characters[cid]["description"] = new_desc
                     else:
                         # Garantir descrição de voz mínima
                         desc = str(cdata.get("description", ""))  # <-- FORÇAR STRING
                         if not desc or "voz" not in desc.lower():
-                            name = cdata.get("name", cid)
+                            name = str(cdata.get("name", cid))    # <-- FORÇAR STRING (por segurança)
                             cdata["description"] = f"Voz neutra, português de Portugal, tom neutro. ({name})"
                         all_characters[cid] = cdata
 
@@ -747,6 +758,10 @@ Responde APENAS com JSON válido:
 
     n_final = len(all_characters) - 1
     logger.info(f"✅ Fase 1 (consolidada) concluída: {n_final} personagem(s) final(is).")
+    end_phase1 = time.time()
+    duration = end_phase1 - start_phase1
+    logger.info(f"✅ Fase 1 concluída em {duration:.1f}s ({duration/60:.1f}min)")
+
     for cid, c in all_characters.items():
         if cid != "narrator" and isinstance(c, dict):
             logger.info(f"   - {cid}: {c.get('name', cid)}")
@@ -984,7 +999,7 @@ async def analyze_block(
     estimated_response_tokens = max(4096, text_length * 2)
     needed_ctx = estimated_prompt_tokens + estimated_response_tokens
 
-    base_num_ctx     = max(8192, min(needed_ctx, 32768))
+    base_num_ctx = max(8192, min(needed_ctx, 12288))
     # Arredondar para a potência de 2 mais próxima para eficiência
     for p in (8192, 16384, 32768):
         if base_num_ctx <= p:
@@ -1035,11 +1050,16 @@ Analisa este trecho em PT-PT. Identifica TODAS as falas e classifica a EMOÇÃO 
    - "..." → **sad**, **tense** ou **fearful**
    - "?" → **tense** (dúvida, surpresa)
 
-3. Palavras de intensidade:
+3.  ⚠️ REGRAS ESPECIAIS PARA LIVROS CLÁSSICOS / DENSO:
+    1. DIÁLOGOS EMBUTIDOS: Se um parágrafo do narrador contém aspas no meio de uma frase descritiva (ex: "Ele olhou para o céu, 'que belo dia', pensou ele, e continuou a andar."), deves extrair a fala ('que belo dia') como um segmento separado com a personagem correta, e o resto como narrador.
+    2. ASPAS FALSAS: Se as aspas estiverem a envolver uma única palavra para ironia, sarcasmo ou um conceito abstrato (ex: "Ele era um 'grande' amigo"), NÃO consideres isso como discurso direto. Atribui ao narrador.
+    3. ESTILO INDIRETO LIVRE: Se houver uma sequência de frases curtas entre aspas sem verbos de elocução (ex: "«Sim. Não. Talvez.»"), tenta inferir o falante pelo contexto do parágrafo anterior. Se for impossível, atribui ao narrador.   
+
+4. Palavras de intensidade:
    - "oh!", "ah!", "uau!" → **joyful**
    - "ai!", "meu Deus!" → **fearful**, **sad** ou **angry**
 
-4. Tom da descrição:
+5. Tom da descrição:
    - "calmamente", "serenamente" → **calm**
    - "nervosamente", "hesitante" → **tense**
    - "com raiva", "irado" → **angry**

@@ -199,7 +199,7 @@ class TTSEngine:
                     continue
 
                 q = validate_audio(anchor_path, ANCHOR_TEXT)
-                
+
                 # ── ADICIONAR LIMITE DE 390KB SÓ PARA ÂNCORAS AQUI ──
                 if q.ok and Path(anchor_path).stat().st_size > 390 * 1024:
                     self.log(f"   ⚠️ [{attempt}] Âncora gerada é demasiado grande (>390KB). A rejeitar...")
@@ -392,14 +392,38 @@ class TTSEngine:
 
     def generate_design(self, text: str, description: str, emotion: str, out_path: str) -> bool:
 
-        is_narrator = "narrator" in description.lower() or "narrador" in description.lower()
+        # BUG CORRIGIDO: a versão anterior referenciava `character_id`, uma
+        # variável que nunca era passada a esta função (nem existia no seu
+        # âmbito) — rebentava com NameError em TODA chamada não-âncora.
+        # Além disso, usava uma lista de IDs hardcoded de um livro específico
+        # ("landon_carter", "hegbert_sullivan", etc.), o que quebrava a
+        # universalidade da aplicação para qualquer outro livro.
+        #
+        # Correção: o género é derivado da própria `description`, que já
+        # contém sempre uma palavra de género explícita ("masculina"/
+        # "feminina") — garantido por clean_character_descriptions() em
+        # post_processor.py para TODAS as personagens, de qualquer livro.
+        desc_lower = description.lower()
+        is_narrator = "narrator" in desc_lower or "narrador" in desc_lower
         gender_fix = "Voz masculina, homem de Portugal. " if is_narrator else ""
+
+        if "feminina" in desc_lower or "feminino" in desc_lower:
+            gender = "feminino"
+        elif "masculina" in desc_lower or "masculino" in desc_lower:
+            gender = "masculino"
+        else:
+            # Sem sinal de género explícito na descrição — não assumir por defeito
+            # (a versão anterior assumia sempre "feminino", o que era arbitrário
+            # e incorreto sempre que a descrição não tivesse o género).
+            gender = ""
+
+        gender_clause = f"Voz {gender}, clara, sem ruído. " if gender else "Voz clara, sem ruído. "
 
         full_instruct = (
             f"{description}. {gender_fix}"
-            "Sotaque de Portugal. Português Europeu. "
-            f"Voz clara, sem ruído. Emoção: {emotion}."
-            f"{PTPT_ACCENT_SUFFIX}"   # ← adicionar esta linha
+            f"Sotaque de Portugal. Português Europeu. "
+            f"{gender_clause}Emoção: {emotion}."
+            f"{PTPT_ACCENT_SUFFIX}"
         )
 
         # Temperatura base baixa para estabilidade; sobe ligeiramente a cada falha
