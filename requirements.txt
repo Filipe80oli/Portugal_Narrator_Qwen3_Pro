@@ -11,6 +11,7 @@ beautifulsoup4         # Limpeza de tags HTML de EPUBs
 requests               # Chamadas à API do Ollama
 
 # --- IA e Síntese de Voz (TTS) ---
+pyrubberband
 torch                  # Base para modelos transformer
 qwen-tts               # Biblioteca principal para Qwen3-TTS
 numpy                  # Manipulação de matrizes de áudio

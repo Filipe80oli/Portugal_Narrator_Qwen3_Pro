@@ -11,7 +11,10 @@ import logging
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 import torch
+import importlib
 import json
+from pathlib import Path
+from typing import Optional
 import numpy as np
 import soundfile as sf
 from config.settings import (
@@ -49,7 +52,16 @@ class TTSEngine:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _load_model_sync(self, model_id: str, label: str):
-        from qwen_tts import Qwen3TTSModel
+        
+        try:
+            qwen_tts_mod = importlib.import_module('qwen_tts')
+            Qwen3TTSModel = getattr(qwen_tts_mod, 'Qwen3TTSModel')
+        except ImportError as e:
+            raise ImportError(
+                "Módulo 'qwen_tts' não encontrado. Instale 'qwen-tts' "
+                "ou use o ambiente de execução correto."
+            ) from e
+
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         dtype  = torch.bfloat16 if device == 'cuda' else torch.float32
         attn   = 'sdpa' if device == 'cuda' else 'eager'
@@ -225,14 +237,8 @@ class TTSEngine:
 
 
     async def ensure_anchor(self, cid: str, cdata: dict):
-        """
-        Cria âncora de voz PT-PT (VoiceDesign) para personagens sem .wav externo.
-        Primeiro verifica se já existe no disco, reutilizando se possível.
-        """
         anchor_path = self.temp_dir / f"anchor_{cid}.wav"
 
-        # ── PRIORIDADE 1: Verificar se já existe no disco (reutilizar) ────────
-        # Substituir linhas 183-188:
         if anchor_path.exists() and anchor_path.stat().st_size > 1024:
             q = validate_audio(str(anchor_path), ANCHOR_TEXT)
             if q.ok:
@@ -244,34 +250,47 @@ class TTSEngine:
                 self.log(f"   ♻️❌ Âncora em disco inválida ({q.reason}) — a regenerar...")
                 anchor_path.unlink(missing_ok=True)
 
-        # ── PRIORIDADE 2: Já tem áudio e texto de referência → nada a fazer ───
         if cdata.get("ref_audio") and cdata.get("ref_text") is not None:
             return
 
-        # ── PRIORIDADE 3: .wav externo fornecido pelo utilizador ───────────────
         if cdata.get("ref_audio") and not anchor_path.exists():
             cdata.setdefault("ref_text", "")
             return
 
-        # ── PRIORIDADE 4: Gerar nova âncora com VoiceDesign PT-PT ────────────────────
         base_desc = cdata.get("description", "Voz neutra")
-        
-        # FORÇAR SEMPRE SOTAQUE PORTUGUÊS EUROPEU
-        if cid == "narrator":
-            instruct = NARRATOR_PT_PT_INSTRUCT
-        else:
-            # Versão simplificada mas forte para a âncora inicial
-            gender_force = "MAN" if "masculin" in base_desc.lower() or "homem" in base_desc.lower() else "WOMAN"
-            age_force = "Senior" if "idoso" in base_desc.lower() else "Adult"
-            
-            instruct = (
-                f"Identity: BIOLOGICAL {gender_force}. Age: {age_force}. "
-                f"Description: {base_desc}. "
-                f"Accent: Strictly Portuguese from Portugal (PT-PT). "
-                f"Quality: Deep resonance, clear chest voice." if gender_force == "MAN" else "Quality: Clear head voice."
-            )
+        age = self._extract_age(base_desc.lower())
+        gender = self._infer_gender(base_desc.lower())
 
-        # VoiceDesign precisa de estar carregado
+        if age is None:
+            age_text = "adult"
+        elif age <= 10:
+            age_text = f"{age}-year-old child"
+        elif age <= 18:
+            age_text = f"{age}-year-old teenager"
+        elif age >= 65:
+            age_text = "elderly"
+        else:
+            age_text = f"{age}-year-old adult"
+
+        gender_text = "woman" if gender == "female" else "man"
+
+        # Prompt natural e específico para a âncora
+        instruct = f"""
+    European Portuguese.
+
+    A {age_text} {gender_text}.
+
+    {base_desc}
+
+    Never use a Brazilian accent.
+
+    Speak naturally.
+
+    Maintain the requested age.
+
+    Maintain the requested gender.
+    """
+
         if self.model_design is None:
             await self.load_voicedesign()
 
@@ -292,6 +311,182 @@ class TTSEngine:
             self.log(f"   ⚠️ Âncora falhou → '{cdata.get('name', cid)}' usará VoiceDesign PT-PT por segmento.")
             cdata["ref_audio"] = None
             cdata["ref_text"] = None
+
+    def _build_voice_prompt(self, description: str, emotion: str) -> tuple[str, float, float, int]:
+        """
+        Constrói um prompt natural para o VoiceDesign, com base na descrição e emoção.
+        Retorna: (prompt, temperature, top_p, pitch_semitones)
+        """
+        desc_lower = description.lower()
+        age = self._extract_age(desc_lower)
+        gender = self._infer_gender(desc_lower)
+
+        # Mapeamento de emoção para descrições naturais
+        emotion_text = {
+            "joyful": "happy, smiling, energetic",
+            "sad": "soft, emotional, quiet",
+            "angry": "strong, tense, intense",
+            "fearful": "hesitant, trembling",
+            "calm": "gentle, relaxed",
+            "neutral": "natural and conversational"
+        }.get(emotion.lower(), "natural and conversational")
+
+        # --------------------------------------------
+        # CRIANÇAS (até 10 anos) – pitch shift +3~7 semitones
+        # --------------------------------------------
+        if age is not None and age <= 10:
+            if gender == "female":
+                prompt = f"""
+    A Portuguese girl aged {age}.
+
+    Her voice is unmistakably that of a little child.
+
+    Very high natural pitch.
+
+    Small vocal tract.
+
+    Tiny body.
+
+    Playful.
+
+    Sweet.
+
+    Curious.
+
+    Energetic.
+
+    Laughs easily.
+
+    Never sounds like a teenager.
+
+    Never sounds like an adult.
+
+    European Portuguese accent.
+
+    Speech style:
+    {emotion_text}.
+    """
+                return prompt, 0.18, 0.88, 7   # pitch +7 semitones para meninas
+            else:
+                prompt = f"""
+    A Portuguese boy aged {age}.
+
+    His voice is clearly that of an eight-year-old child.
+
+    High natural pitch.
+
+    Small vocal tract.
+
+    Light resonance.
+
+    No signs of puberty.
+
+    Playful.
+
+    Excited.
+
+    Energetic.
+
+    Very expressive.
+
+    Never sounds like a teenager.
+
+    Never sounds like an adult.
+
+    European Portuguese accent.
+
+    Speech style:
+    {emotion_text}.
+    """
+                return prompt, 0.18, 0.88, 5   # pitch +5 semitones para meninos
+
+        # --------------------------------------------
+        # ADOLESCENTES (11-18 anos) – pitch shift leve ou nenhum
+        # --------------------------------------------
+        if age is not None and age <= 18:
+            if gender == "female":
+                prompt = f"""
+    Portuguese teenage girl.
+
+    Age {age}.
+
+    Bright feminine voice.
+
+    Youthful.
+
+    Natural.
+
+    Fresh.
+
+    Slightly immature.
+
+    European Portuguese accent.
+
+    Speech style:
+    {emotion_text}.
+    """
+                return prompt, 0.15, 0.82, 2   # +2 semitones para suavizar
+            else:
+                prompt = f"""
+    Portuguese teenage boy.
+
+    Age {age}.
+
+    Voice beginning puberty.
+
+    Still youthful.
+
+    Medium-high pitch.
+
+    European Portuguese accent.
+
+    Speech style:
+    {emotion_text}.
+    """
+                return prompt, 0.15, 0.82, 1   # +1 semitone (ligeiro)
+
+        # --------------------------------------------
+        # MULHER ADULTA
+        # --------------------------------------------
+        if gender == "female":
+            prompt = f"""
+    Adult Portuguese woman.
+
+    Natural feminine voice.
+
+    Clear head resonance.
+
+    Elegant.
+
+    Natural.
+
+    European Portuguese accent.
+
+    Speech style:
+    {emotion_text}.
+    """
+            return prompt, 0.08, 0.75, 0
+
+        # --------------------------------------------
+        # HOMEM ADULTO (fallback)
+        # --------------------------------------------
+        prompt = f"""
+    Adult Portuguese man.
+
+    Natural masculine voice.
+
+    Chest resonance.
+
+    Warm.
+
+    Natural.
+
+    European Portuguese accent.
+
+    Speech style:
+    {emotion_text}.
+    """
+        return prompt, 0.08, 0.75, 0
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Síntese com Retry + Validação de Qualidade (TEMPERATURA BAIXA PARA EVITAR RUÍDO)
@@ -393,89 +588,133 @@ class TTSEngine:
         )
 
     def generate_design(self, text: str, description: str, emotion: str, out_path: str) -> bool:
-        desc_lower = description.lower()
-        
-        # 1. IDENTIFICAÇÃO DE PERFIL (Deteção Universal)
-        is_narrator = any(k in desc_lower for k in ["narrador", "narrator"])
-        
-        # Keywords para evitar confusão linguística (ex: madurA -> feminino)
-        female_keywords = ["feminin", "mulher", "female", "woman", "rapariga", "menina", "mrs", "miss", "sra", "senhora", "misteriosa"]
-        child_keywords = ["criança", "menino", "menina", "miúdo", "child", "kid", "8 anos", "10 anos", "infantil"]
-        
-        # Lógica de decisão
-        is_female = any(k in desc_lower for k in female_keywords) and not is_narrator
-        is_child = any(k in desc_lower for k in child_keywords) and not is_narrator
+        """
+        Gera áudio usando VoiceDesign com prompt natural e pós-processamento de pitch.
+        """
+        # 1. Construir prompt e parâmetros
+        prompt, temp, top_p, pitch_semitones = self._build_voice_prompt(description, emotion)
 
-        # 2. DEFINIÇÃO DE HARDWARE VOCAL (Prioridade: Narrador > Criança > Adulto)
-        if is_narrator:
-            # --- OVERRIDE NARRADOR: Blindagem contra voz feminina ---
-            identity = "MATURE MALE SPEAKER"
-            spec = (
-                "A mature man, 55 years old. Deep resonant baritone voice, "
-                "heavy chest resonance, authoritative cinematic narration, professional quality. "
-                "Absolutely NO female characteristics. Low-pitched frequency only."
-            )
-            constraint = "STRICT_CONSTRAINT: BIOLOGICAL_MAN. FREQUENCY_LIMIT: LOW."
+        self.log(f"   🎤 Gerando voz com prompt: {prompt[:80]}...")
 
-        elif is_child:
-            # --- ROGER: Juvenil Neutro ---
-            identity = "JUVENILE SPEAKER"
-            spec = (
-                "A small child, 8 years old. High-pitched juvenile voice, short vocal cords, "
-                "clear head resonance, youthful. Strictly ignore gender depth. No adult resonance."
-            )
-            constraint = "STRICT_CONSTRAINT: CHILD_VOICE. NO_BASS."
-
-        elif is_female:
-            # --- MULHERES ---
-            identity = "FEMALE SPEAKER"
-            if any(k in desc_lower for k in ["jovem", "young", "rapariga"]):
-                spec = "Young woman, 20 years old. High-pitched feminine voice, bright head resonance."
-            else:
-                spec = "Adult woman, 35 years old. Clear natural feminine voice, high pitch."
-            constraint = "STRICT_CONSTRAINT: BIOLOGICAL_WOMAN."
-
-        else:
-            # --- HOMENS ADULTOS (Landon, Hegbert, etc.) ---
-            identity = "MALE SPEAKER"
-            if any(k in desc_lower for k in ["idoso", "velho", "senior"]):
-                spec = "Old senior man, 75 years old. Weathered raspy voice, slow solemn delivery."
-                constraint = "STRICT_CONSTRAINT: SENIOR_MAN."
-            else:
-                # Landon / Eric (17-25 anos)
-                spec = "Young man, 22 years old. Natural masculine voice, clear and casual, grounded pitch."
-                constraint = "STRICT_CONSTRAINT: YOUNG_MAN."
-
-        # 3. MONTAGEM DO PROMPT FINAL (Instrução Técnica)
-        full_instruct = (
-            f"SPEAKER_IDENTITY: {identity}. {constraint} "
-            f"PHYSICAL_ACOUSTICS: [{spec}] "
-            f"ACCENT: Strictly European Portuguese from Portugal (PT-PT). "
-            f"PHONETICS: Closed vowels, stress-timed cadence. EMOTION: {emotion}. "
-            f"{PTPT_ACCENT_SUFFIX}"
-        )
-
-        self.log(f"   🚀 UNIVERSAL FORCE: {identity} | Spec: {spec[:40]}...")
-
-        # 4. GERAÇÃO (Temperatura 0.01 para travar a laringe)
-        current_temp = 0.01 
+        # 2. Gerar áudio
         for attempt in range(1, TTS_MAX_RETRIES + 1):
             try:
                 wavs, sr = self.model_design.generate_voice_design(
                     text=text,
-                    instruct=full_instruct,
+                    instruct=prompt,
                     language='portuguese',
-                    temperature=current_temp,
-                    top_p=0.4, 
+                    temperature=temp,
+                    top_p=top_p,
                     max_new_tokens=TTS_MAX_NEW_TOKENS,
                 )
-                if not self._write_audio(wavs, sr, out_path): continue
+                if not self._write_audio(wavs, sr, out_path):
+                    continue
+
+                # 3. Aplicar pitch shift se necessário
+                if pitch_semitones > 0:
+                    shifted_path = out_path + ".shifted.wav"
+                    if self._pitch_shift(out_path, shifted_path, semitones=pitch_semitones):
+                        import shutil
+                        shutil.move(shifted_path, out_path)
+                        self.log(f"   ✅ Pitch shift aplicado: +{pitch_semitones} semitones")
+                    else:
+                        self.log("   ⚠️ Pitch shift falhou, a usar áudio original")
+
+                # 4. Validar qualidade
                 q = validate_audio(out_path, text)
-                if q.ok: return True
-                else: Path(out_path).unlink(missing_ok=True); current_temp += 0.05
+                if q.ok:
+                    return True
+                else:
+                    Path(out_path).unlink(missing_ok=True)
+                    temp += 0.03
+                    self.log(f"   ⚠️ Validação falhou, tentativa {attempt} com temp={temp:.2f}")
+
             except Exception as e:
-                self.log(f"   ❌ Erro: {e}"); current_temp += 0.05
+                self.log(f"   ❌ Erro na tentativa {attempt}: {e}")
+                temp += 0.05
+
         return False
+
+
+    # --- FUNÇÕES AUXILIARES ---
+
+    def _pitch_shift(self, input_path: str, output_path: str, semitones: float) -> bool:
+        """
+        Altera o pitch e os formantes para simular trato vocal mais curto.
+        Usa Rubber Band se disponível, senão ffmpeg (apenas pitch).
+        """
+        try:
+            import pyrubberband as pyrb
+            import soundfile as sf
+            import numpy as np
+
+            # Carregar áudio
+            y, sr = sf.read(input_path)
+
+            # Aplicar pitch shift com formant correction (Rubber Band)
+            # `formant` preserva o timbre original, mas para crianças queremos alterar formantes também.
+            # Para simular trato mais curto, usamos formant_scale > 1.0 (ex: 1.2)
+            # Aqui, para simplificar, usamos apenas pitch shift, mas o Rubber Band permite
+            # preservar formantes (o que pode não ser ideal para crianças, mas é mais natural).
+            # Vamos usar a opção padrão (que já ajusta formantes ligeiramente).
+            y_shifted = pyrb.pitch_shift(y, sr, semitones)
+
+            # Escrever
+            sf.write(output_path, y_shifted, sr)
+            return True
+
+        except ImportError:
+            # Fallback: ffmpeg (sem formant correction, apenas pitch)
+            self.log("   ⚠️ pyrubberband não instalado. Usando ffmpeg (apenas pitch).")
+            try:
+                factor = 2 ** (semitones / 12.0)
+                cmd = [
+                    'ffmpeg', '-y', '-i', input_path,
+                    '-af', f'asetrate=44100*{factor},atempo={1/factor}',
+                    '-c:a', 'pcm_s16le', output_path
+                ]
+                subprocess.run(cmd, capture_output=True, check=True, timeout=30)
+                return True
+            except Exception as e:
+                self.log(f"   ❌ ffmpeg pitch shift falhou: {e}")
+                return False
+        except Exception as e:
+            self.log(f"   ❌ Rubber Band falhou: {e}")
+            return False
+
+    def _extract_age(self, desc_lower: str) -> Optional[int]:
+        patterns = [
+            r'(?:cerca de|cerca|aproximadamente|~)?\s*(\d+)\s*anos?\s*(?:de\s*idade)?',
+            r'(\d+)\s*-\s*ano[s]?[\s-]?old',
+            r'(\d+)\s*year[s]?\s+old',
+        ]
+        for pat in patterns:
+            match = re.search(pat, desc_lower, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        return None
+
+    def _infer_gender(self, desc_lower: str) -> str:
+        """Infere gênero a partir de palavras-chave na descrição."""
+        female_words = ["feminin", "mulher", "female", "woman", "rapariga", "menina", "mrs", "miss", "sra", "senhora", "misteriosa"]
+        male_words = ["masculin", "homem", "male", "man", "rapaz", "menino", "mr", "sr", "senhor"]
+
+        if any(k in desc_lower for k in female_words):
+            return "female"
+        elif any(k in desc_lower for k in male_words):
+            return "male"
+        else:
+            return "unknown"
+
+    def _write_audio(self, wavs, sr, out_path) -> bool:
+        """Escreve o áudio para o arquivo (implementação depende da sua biblioteca)."""
+        try:
+            import soundfile as sf
+            sf.write(out_path, wavs, sr)
+            return True
+        except Exception as e:
+            self.log(f"   ❌ Erro ao escrever áudio: {e}")
+            return False
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Utilitários
