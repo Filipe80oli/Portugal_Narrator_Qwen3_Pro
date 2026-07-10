@@ -7,7 +7,7 @@
   "ollama_temperature": 0.1,
   "ollama_num_predict": 8192,
   "tts_pace_default": 1.0,
-  "tts_max_retries": 4,
+  "tts_max_retries": 5,
   "ollama_model": "qwen3:32b",
   "ollama_batch_size": 4,
   "auto_revise": 1,

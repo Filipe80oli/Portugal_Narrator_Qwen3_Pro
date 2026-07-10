@@ -260,13 +260,15 @@ class TTSEngine:
         if cid == "narrator":
             instruct = NARRATOR_PT_PT_INSTRUCT
         else:
-            # ANTES: instruct = f"Voz portuguesa de Portugal. {base_desc}. Sotaque europeu estrito."
-            # DEPOIS: mesma força que o narrador, adaptada ao género/descrição
+            # Versão simplificada mas forte para a âncora inicial
+            gender_force = "MAN" if "masculin" in base_desc.lower() or "homem" in base_desc.lower() else "WOMAN"
+            age_force = "Senior" if "idoso" in base_desc.lower() else "Adult"
+            
             instruct = (
-                f"{base_desc}."
-                f" Sotaque de Portugal continental, português europeu."
-                f" Vogais fechadas, ritmo europeu. Nunca brasileiro."
-                f" Dicção clara de Lisboa ou Porto."
+                f"Identity: BIOLOGICAL {gender_force}. Age: {age_force}. "
+                f"Description: {base_desc}. "
+                f"Accent: Strictly Portuguese from Portugal (PT-PT). "
+                f"Quality: Deep resonance, clear chest voice." if gender_force == "MAN" else "Quality: Clear head voice."
             )
 
         # VoiceDesign precisa de estar carregado
@@ -391,82 +393,88 @@ class TTSEngine:
         )
 
     def generate_design(self, text: str, description: str, emotion: str, out_path: str) -> bool:
-
-        # BUG CORRIGIDO: a versão anterior referenciava `character_id`, uma
-        # variável que nunca era passada a esta função (nem existia no seu
-        # âmbito) — rebentava com NameError em TODA chamada não-âncora.
-        # Além disso, usava uma lista de IDs hardcoded de um livro específico
-        # ("landon_carter", "hegbert_sullivan", etc.), o que quebrava a
-        # universalidade da aplicação para qualquer outro livro.
-        #
-        # Correção: o género é derivado da própria `description`, que já
-        # contém sempre uma palavra de género explícita ("masculina"/
-        # "feminina") — garantido por clean_character_descriptions() em
-        # post_processor.py para TODAS as personagens, de qualquer livro.
         desc_lower = description.lower()
-        is_narrator = "narrator" in desc_lower or "narrador" in desc_lower
-        gender_fix = "Voz masculina, homem de Portugal. " if is_narrator else ""
+        
+        # 1. IDENTIFICAÇÃO DE PERFIL (Deteção Universal)
+        is_narrator = any(k in desc_lower for k in ["narrador", "narrator"])
+        
+        # Keywords para evitar confusão linguística (ex: madurA -> feminino)
+        female_keywords = ["feminin", "mulher", "female", "woman", "rapariga", "menina", "mrs", "miss", "sra", "senhora", "misteriosa"]
+        child_keywords = ["criança", "menino", "menina", "miúdo", "child", "kid", "8 anos", "10 anos", "infantil"]
+        
+        # Lógica de decisão
+        is_female = any(k in desc_lower for k in female_keywords) and not is_narrator
+        is_child = any(k in desc_lower for k in child_keywords) and not is_narrator
 
-        if "feminina" in desc_lower or "feminino" in desc_lower:
-            gender = "feminino"
-        elif "masculina" in desc_lower or "masculino" in desc_lower:
-            gender = "masculino"
+        # 2. DEFINIÇÃO DE HARDWARE VOCAL (Prioridade: Narrador > Criança > Adulto)
+        if is_narrator:
+            # --- OVERRIDE NARRADOR: Blindagem contra voz feminina ---
+            identity = "MATURE MALE SPEAKER"
+            spec = (
+                "A mature man, 55 years old. Deep resonant baritone voice, "
+                "heavy chest resonance, authoritative cinematic narration, professional quality. "
+                "Absolutely NO female characteristics. Low-pitched frequency only."
+            )
+            constraint = "STRICT_CONSTRAINT: BIOLOGICAL_MAN. FREQUENCY_LIMIT: LOW."
+
+        elif is_child:
+            # --- ROGER: Juvenil Neutro ---
+            identity = "JUVENILE SPEAKER"
+            spec = (
+                "A small child, 8 years old. High-pitched juvenile voice, short vocal cords, "
+                "clear head resonance, youthful. Strictly ignore gender depth. No adult resonance."
+            )
+            constraint = "STRICT_CONSTRAINT: CHILD_VOICE. NO_BASS."
+
+        elif is_female:
+            # --- MULHERES ---
+            identity = "FEMALE SPEAKER"
+            if any(k in desc_lower for k in ["jovem", "young", "rapariga"]):
+                spec = "Young woman, 20 years old. High-pitched feminine voice, bright head resonance."
+            else:
+                spec = "Adult woman, 35 years old. Clear natural feminine voice, high pitch."
+            constraint = "STRICT_CONSTRAINT: BIOLOGICAL_WOMAN."
+
         else:
-            # Sem sinal de género explícito na descrição — não assumir por defeito
-            # (a versão anterior assumia sempre "feminino", o que era arbitrário
-            # e incorreto sempre que a descrição não tivesse o género).
-            gender = ""
+            # --- HOMENS ADULTOS (Landon, Hegbert, etc.) ---
+            identity = "MALE SPEAKER"
+            if any(k in desc_lower for k in ["idoso", "velho", "senior"]):
+                spec = "Old senior man, 75 years old. Weathered raspy voice, slow solemn delivery."
+                constraint = "STRICT_CONSTRAINT: SENIOR_MAN."
+            else:
+                # Landon / Eric (17-25 anos)
+                spec = "Young man, 22 years old. Natural masculine voice, clear and casual, grounded pitch."
+                constraint = "STRICT_CONSTRAINT: YOUNG_MAN."
 
-        gender_clause = f"Voz {gender}, clara, sem ruído. " if gender else "Voz clara, sem ruído. "
-
+        # 3. MONTAGEM DO PROMPT FINAL (Instrução Técnica)
         full_instruct = (
-            f"{description}. {gender_fix}"
-            f"Sotaque de Portugal. Português Europeu. "
-            f"{gender_clause}Emoção: {emotion}."
+            f"SPEAKER_IDENTITY: {identity}. {constraint} "
+            f"PHYSICAL_ACOUSTICS: [{spec}] "
+            f"ACCENT: Strictly European Portuguese from Portugal (PT-PT). "
+            f"PHONETICS: Closed vowels, stress-timed cadence. EMOTION: {emotion}. "
             f"{PTPT_ACCENT_SUFFIX}"
         )
 
-        # Temperatura base baixa para estabilidade; sobe ligeiramente a cada falha
-        # para dar ao modelo margem de variação sem explodir para ruído
-        BASE_TEMP = 0.15
-        TEMP_STEP = 0.04
-        MAX_TEMP  = 0.35  # nunca subir acima disto no VoiceDesign
+        self.log(f"   🚀 UNIVERSAL FORCE: {identity} | Spec: {spec[:40]}...")
 
+        # 4. GERAÇÃO (Temperatura 0.01 para travar a laringe)
+        current_temp = 0.01 
         for attempt in range(1, TTS_MAX_RETRIES + 1):
-            temp = min(BASE_TEMP + (attempt - 1) * TEMP_STEP, MAX_TEMP)
-            # top_p desce ligeiramente com temp alta para compensar
-            top_p = 0.8 if temp <= 0.2 else max(0.65, 0.8 - (attempt - 1) * 0.04)
-
             try:
-                self.log(f"   🎙️ VoiceDesign tentativa {attempt}/{TTS_MAX_RETRIES} "
-                        f"(temp={temp:.2f}, top_p={top_p:.2f})...")
-
                 wavs, sr = self.model_design.generate_voice_design(
                     text=text,
                     instruct=full_instruct,
                     language='portuguese',
-                    temperature=temp,
-                    top_p=top_p,
+                    temperature=current_temp,
+                    top_p=0.4, 
                     max_new_tokens=TTS_MAX_NEW_TOKENS,
                 )
-
-                if not self._write_audio(wavs, sr, out_path):
-                    self.log(f"   ⚠️ [{attempt}] _write_audio falhou (ruído ou write error)")
-                    continue
-
+                if not self._write_audio(wavs, sr, out_path): continue
                 q = validate_audio(out_path, text)
-                if q.ok:
-                    if attempt > 1:
-                        self.log(f"   ✅ VoiceDesign OK na tentativa {attempt}")
-                    return True
-                else:
-                    self.log(f"   ⚠️ [{attempt}] Validação falhou: {q.reason} "
-                            f"(rms={q.rms:.4f}, zcr={q.zcr:.4f})")
-
+                if q.ok: return True
+                else: Path(out_path).unlink(missing_ok=True); current_temp += 0.05
             except Exception as e:
-                self.log(f"   ⚠️ [{attempt}] Excepção VoiceDesign: {e}")
-
-        self.log(f"   ❌ VoiceDesign esgotou {TTS_MAX_RETRIES} tentativas para: {text[:40]}...")
+                self.log(f"   ❌ Erro: {e}"); current_temp += 0.05
         return False
 
     # ═══════════════════════════════════════════════════════════════════════════

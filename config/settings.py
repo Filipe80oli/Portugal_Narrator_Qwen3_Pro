@@ -42,8 +42,9 @@ NARRATOR_PT_PT_INSTRUCT = (
 )
 
 PTPT_ACCENT_SUFFIX = (
-    " Sotaque de Portugal continental, português europeu. "
-    "Nunca brasileiro. Vogais fechadas, dicção clara de Lisboa."
+    " Strictly European Portuguese accent (PT-PT). "
+    "Vogais fechadas e curtas, ritmo de fala stress-timed, sem sotaque do Brasil. "
+    "Dicção de Lisboa, Portugal continental."
 )
 
 ANCHOR_TEXT = (
