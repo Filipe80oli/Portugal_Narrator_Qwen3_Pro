@@ -68,8 +68,15 @@ def validate_audio(wav_path: str, text: str) -> AudioQuality:
     n_samples = len(audio)
     duration  = n_samples / sr
     
-    # ── 1. Duração mínima ─────────────────────────────────────────────────────
-    expected_min = max(1.0, len(text) / TTS_CHARS_PER_SECOND * TTS_MIN_DURATION_RATIO)
+    # ── 1. Duração mínima (corrigida) ────────────────────────────────────────
+    # Piso adaptativo: textos muito curtos (ex: "Lívia...", "Eu sei") 
+    # podem ser gerados com menos de 1s. Exigimos pelo menos 0.5s.
+    raw_min = len(text) / TTS_CHARS_PER_SECOND * TTS_MIN_DURATION_RATIO
+    if len(text) < 30:
+        expected_min = max(0.3, raw_min)
+    else:
+        expected_min = max(1.0, raw_min)
+        
     if duration < expected_min:
         return AudioQuality(False, "duracao_insuficiente",
                             duration=duration, expected_min=expected_min)

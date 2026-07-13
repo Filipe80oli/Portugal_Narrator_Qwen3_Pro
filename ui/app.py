@@ -35,7 +35,7 @@ from core.ollama_analyzer import (
     NameMapper, resolve_generic_ids,
     map_emotion
 )
-from core.post_processor import post_process_analysis_universal
+from core.post_processor import post_process_analysis_universal, fix_known_errors
 from tts.engine import TTSEngine
 from tts.exporter import create_m4b
 from cinema.sound_analyzer import analyze_sounds_batch
@@ -974,6 +974,16 @@ class AudiobookApp(ctk.CTk):
             self.log(f"   🧹 {unknown_cid_count} segmento(s) com character_id inexistente repostos para 'narrator'.")
 
         self.log(f"✨ Análise concluída: {len(self.characters)} personagens, {len(self.segments)} segmentos.")
+
+        # 11b. CORREÇÕES ESTRUTURAIS FINAIS (split fala/tag, hífen de diálogo)
+        # IMPORTANTE: corre aqui, DEPOIS de resolve_generic_ids, do smart splitter
+        # e da revise_analysis (Ollama), porque esses passos podem reintroduzir
+        # texto do original ainda com "-"/"—" por dividir. Se isto corresse só
+        # dentro de post_process_analysis_universal (passo 4), a normalização
+        # de hífen e o split fala/tag não sobreviviam até ao ficheiro final.
+        self.log("✂️ A aplicar correções estruturais finais (hífen/travessão, fala vs. tag)...")
+        self.segments = fix_known_errors(self.segments, self.characters)
+        self.log(f"   ✅ {len(self.segments)} segmentos após correções estruturais.")
 
         # 12. GUARDAR ANÁLISE
         saved = save_analysis(self.file_path, self.raw_text, self.characters, self.segments, self.model_name)

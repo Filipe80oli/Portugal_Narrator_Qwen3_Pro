@@ -5,6 +5,45 @@ from typing import Dict, List, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Hífen isolado por espaço (início "- " ou meio " - ") usado como substituto
+# do travessão tipográfico "—" em muitos ebooks convertidos (comum em textos
+# PT-BR, ex.: "- Vou já - disse ela."). Só considera hífen isolado por espaço
+# em ambos os lados (ou início de segmento seguido de espaço) — nunca hífen
+# colado a letras, para não estragar palavras compostas ("arco-íris") ou
+# intervalos numéricos ("10-15").
+_DIALOGUE_HYPHEN_PATTERN = re.compile(r'(^|\s)-(?=\s)')
+
+
+def normalize_dialogue_dashes(text: str) -> str:
+    """
+    Normaliza hífens usados como travessão de diálogo para o travessão
+    tipográfico "—", para que toda a lógica existente neste módulo (que
+    procura literalmente "—" para detetar/dividir fala vs. narração/tag)
+    funcione também em livros que usam "-" em vez de "—". Idempotente:
+    texto já com "—" e sem hífens isolados não é alterado.
+    """
+    if not text or "-" not in text:
+        return text
+    return _DIALOGUE_HYPHEN_PATTERN.sub(lambda m: m.group(1) + "—", text)
+
+
+def normalize_segment_dashes(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Aplica normalize_dialogue_dashes ao texto de todos os segmentos, in place."""
+    changed = 0
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        text = seg.get("text", "")
+        new_text = normalize_dialogue_dashes(text)
+        if new_text != text:
+            seg["text"] = new_text
+            changed += 1
+    if changed:
+        logger.info(
+            f"🧹 {changed} segmento(s) com hífen de diálogo normalizado para travessão '—'."
+        )
+    return segments
+
 
 def fix_narration_misattributed_as_speech(
     characters: Dict[str, Dict[str, Any]],
@@ -56,6 +95,80 @@ def fix_narration_misattributed_as_speech(
         logger.info(
             f"🧹 {fixed_count} segmento(s) de narração indevidamente atribuídos "
             f"a uma personagem foram repostos para 'narrator'."
+        )
+
+    return segments
+
+
+# Verbos dicendi/cogitandi comuns em PT-PT usados para relatar (não citar) fala ou pensamento
+_VERBA_DICENDI = (
+    r'disse|respondeu|perguntou|pensou|refletiu|sugeriu|admitiu|confessou|'
+    r'murmurou|gritou|exclamou|replicou|acrescentou|insistiu|concordou|negou|'
+    r'afirmou|declarou|sussurrou|retorquiu|contou|avisou|garantiu|prometeu|'
+    r'jurou|reconheceu|explicou|observou|comentou'
+)
+
+# Verbo dicendi seguido (a curta distância) de "que"/"se" → discurso INDIRETO
+# (relato do narrador), não citação direta. Ex.: "disse que viria", "perguntou se ela sabia".
+_INDIRECT_SPEECH_PATTERN = re.compile(
+    rf'\b(?:{_VERBA_DICENDI})\b(?:\s+\S+){{0,4}}?\s+\b(que|se)\b',
+    re.IGNORECASE
+)
+
+# Pronome de 1ª pessoa perto do verbo → provavelmente é a própria personagem-narradora
+# a relatar-se a si mesma (capítulo em 1ª pessoa), não deve ser corrigido para "narrator".
+_FIRST_PERSON_GUARD = re.compile(
+    rf'\b(eu|me|minha|meu|comigo)\b(?:\s+\S+){{0,3}}?\s+\b(?:{_VERBA_DICENDI})\b',
+    re.IGNORECASE
+)
+
+
+def fix_indirect_speech_misattributed(
+    characters: Dict[str, Dict[str, Any]],
+    segments: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Complementa `fix_narration_misattributed_as_speech`: aquela função só deteta
+    o caso em que o NOME COMPLETO (≥2 palavras) da personagem aparece no texto.
+    Esta cobre o caso, mais comum, em que a frase usa um pronome ("ela", "ele")
+    ou um verbo dicendi ("disse que...", "perguntou se...") em vez do nome —
+    ou seja, discurso INDIRETO relatado pelo narrador, que o LLM por vezes
+    atribui erradamente à personagem mencionada em vez de a "narrator".
+
+    Heurística (conservadora):
+    Reclassifica para "narrator" apenas se TODAS as condições se verificarem:
+    1. O segmento está atribuído a uma personagem específica (não "narrator").
+    2. O texto contém um verbo dicendi seguido de "que"/"se" a curta distância
+       (padrão típico de discurso indireto: "disse que", "perguntou se").
+    3. O texto NÃO contém nenhum marcador de discurso direto (aspas, travessão).
+    4. O texto NÃO tem um pronome de 1ª pessoa junto ao verbo (o que indicaria
+       que é a própria personagem-narradora a relatar-se, em capítulo na 1ª pessoa).
+    """
+    dialogue_markers = re.compile(r'["“”«»]|—')
+    fixed_count = 0
+
+    for seg in segments:
+        cid = seg.get("character_id")
+        if not cid or cid == "narrator":
+            continue
+        text = seg.get("text", "")
+        if not text:
+            continue
+
+        if not _INDIRECT_SPEECH_PATTERN.search(text):
+            continue
+        if dialogue_markers.search(text):
+            continue
+        if _FIRST_PERSON_GUARD.search(text):
+            continue
+
+        seg["character_id"] = "narrator"
+        fixed_count += 1
+
+    if fixed_count:
+        logger.info(
+            f"🧹 {fixed_count} segmento(s) de discurso indireto indevidamente "
+            f"atribuídos a uma personagem foram repostos para 'narrator'."
         )
 
     return segments
@@ -164,6 +277,10 @@ def post_process_analysis_universal(
             "type": "narrator",
             "description": "Voz masculina madura, português de Portugal"
         }
+    # Normalizar hífens de diálogo ("- fala -") para travessão "—" ANTES de
+    # qualquer deteção/split baseado em "—", para que livros que usam este
+    # formato (comum em ebooks convertidos) sejam cobertos pelas heurísticas.
+    segments = normalize_segment_dashes(segments)
     if normalize:
         from core.text_normalizer import clean_and_normalize_segments
         segments = clean_and_normalize_segments(segments)
@@ -178,6 +295,7 @@ def post_process_analysis_universal(
     if merge_duplicates:
         characters, segments = merge_duplicate_characters(characters, segments)
     segments = fix_narration_misattributed_as_speech(characters, segments)
+    segments = fix_indirect_speech_misattributed(characters, segments)
     used_ids = {seg.get("character_id") for seg in segments if seg.get("character_id")}
     removed_chars = [cid for cid in characters if cid != "narrator" and cid not in used_ids]
     for cid in removed_chars:
@@ -208,3 +326,228 @@ def resolve_alias_conflicts(aliases: Dict[str, List[str]]) -> Dict[str, List[str
             cleaned_aliases[cid] = cleaned_terms
 
     return cleaned_aliases
+
+# Marcadores de 1ª pessoa: usados para decidir se um trecho de narração
+# pertence à personagem que está a narrar a cena (comum em livros com POV
+# alternado por capítulo, ex.: capítulos contados por Lívia e por Paulo),
+# em vez do "narrator" genérico do sistema.
+_first_person_tag_markers = re.compile(
+    r'\b(eu|me|minha|minhas|meu|meus|comigo)\b', re.IGNORECASE
+)
+
+
+def _looks_like_first_person_tag(tag_text: str) -> bool:
+    """
+    Heurística conservadora para decidir se um trecho de narração/tag
+    pertence à personagem (1ª pessoa) em vez do narrador (3ª pessoa).
+
+    1. Se contém pronome/possessivo de 1ª pessoa em qualquer parte do
+       texto (ex.: "...segurando minha mão.") → 1ª pessoa.
+    2. Senão, olha para o primeiro verbo: em português, a 1ª pessoa do
+       presente do indicativo termina tipicamente em "-o" (falo, penso,
+       abraço, arqueio, questiono) e o pretérito perfeito em "-ei"/"-i"
+       (falei, respondi); a 3ª pessoa termina em "-a"/"-e" (presente:
+       implora, elogia, exige) ou "-ou"/"-eu" (pretérito: disse,
+       respondeu, murmurou). Esta distinção não é perfeita (há exceções
+       e verbos irregulares), mas evita o erro mais grave: reatribuir em
+       bloco tags de 1ª pessoa a "narrator" em livros narrados na 1ª pessoa.
+    """
+    if _first_person_tag_markers.search(tag_text):
+        return True
+    match = re.match(r"[^\wÀ-ÿ]*([A-Za-zÀ-ÿ]+)", tag_text)
+    if not match:
+        return False
+    word = match.group(1).lower()
+    return len(word) > 3 and (word.endswith("o") or word.endswith("ei") or word.endswith("i"))
+
+
+def fix_first_person_narration_misattributed_to_narrator(
+    characters: Dict[str, Dict[str, Any]],
+    segments: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Complementa `_looks_like_first_person_tag` para além dos segmentos
+    divididos por `_split_combined_segment`: cobre também segmentos JÁ
+    autónomos (não vieram de nenhum split, o próprio LLM devolveu-os assim)
+    que o LLM atribuiu a "narrator" seguindo a regra geral "narração =
+    narrador", mas que na verdade são a ação/reação da PRÓPRIA personagem
+    que está a narrar aquela cena (ex.: "Arqueio uma sobrancelha, confuso.",
+    "questiono, com um sorriso enorme."), típico de livros com POV alternado
+    por capítulo.
+
+    Heurística (conservadora): se um segmento atribuído a "narrator" tem
+    marcadores claros de 1ª pessoa, só reatribui à personagem não-narrador
+    quando a personagem não-narrador ANTERIOR e a SEGUINTE na sequência
+    concordam (é a mesma). Isto evita amplificar um erro de atribuição já
+    existente vindo de trás (ex.: se um segmento anterior já estava mal
+    atribuído a uma personagem errada por outra causa, usar só "a anterior"
+    como âncora propagaria esse erro para a frente; exigir também que a
+    seguinte concorde reduz bastante esse risco). Numa conversa entre duas
+    personagens, se a anterior e a seguinte forem falantes DIFERENTES, é
+    sinal de que estamos numa troca de diálogo ambígua — mantém-se "narrator"
+    em vez de arriscar um palpite.
+    """
+    fixed_count = 0
+    n = len(segments)
+
+    # Pré-computar, para cada posição, a personagem não-narrador mais próxima
+    # a seguir (evita repetir a procura O(n) para cada segmento narrator).
+    next_non_narrator = [None] * n
+    upcoming = None
+    for i in range(n - 1, -1, -1):
+        next_non_narrator[i] = upcoming
+        cid = segments[i].get("character_id")
+        if cid and cid != "narrator":
+            upcoming = cid
+
+    last_non_narrator_cid = None
+    for idx, seg in enumerate(segments):
+        cid = seg.get("character_id")
+        if cid and cid != "narrator":
+            last_non_narrator_cid = cid
+            continue
+        if cid != "narrator" or last_non_narrator_cid is None:
+            continue
+        text = seg.get("text", "")
+        if not text or not _looks_like_first_person_tag(text):
+            continue
+        forward_cid = next_non_narrator[idx]
+        if forward_cid is not None and forward_cid != last_non_narrator_cid:
+            # Anterior e seguinte discordam — ambíguo, não arriscar palpite.
+            continue
+        seg["character_id"] = last_non_narrator_cid
+        fixed_count += 1
+
+    if fixed_count:
+        logger.info(
+            f"🧹 {fixed_count} segmento(s) de narração em 1ª pessoa indevidamente "
+            f"atribuídos a 'narrator' foram repostos para a personagem que narra a cena."
+        )
+    return segments
+
+
+def fix_known_errors(segments: List[Dict], characters: Dict) -> List[Dict]:
+    """
+    Corrige erros estruturais comuns: divide segmentos que combinam
+    fala e narração, e junta segmentos cortados a meio de frase.
+    Esta versão é universal e não depende de nomes de personagens específicos.
+    """
+    # Defensivo: normaliza hífens de diálogo também aqui, para o caso de esta
+    # função ser chamada diretamente sobre segmentos/cache que não passaram
+    # por post_process_analysis_universal (ex.: análises antigas recarregadas).
+    segments = normalize_segment_dashes(segments)
+
+    def _split_combined_segment(text: str, cid: str, emotion: str) -> List[Dict[str, str]]:
+        """
+        Divide um segmento que combina narração e fala (separadas por "—").
+        Retorna lista de dicionários com "text" e "character_id".
+
+        BUG CORRIGIDO (1/2): a versão anterior tratava apenas o primeiro pedaço
+        (antes do 1º travessão) como narração, e TUDO o resto como fala da
+        personagem. Isto está errado para o padrão típico do diálogo em
+        PT-PT, que alterna: "— fala — disse ele, saindo. — mais fala."
+        Aqui "disse ele, saindo." (entre o 2º e o 3º travessão) é narração/
+        tag, não continuação da fala da personagem — mas a versão anterior
+        atribuía-o à personagem na mesma. A convenção correta é alternância
+        por paridade: cada pedaço PAR (0, 2, 4...) é narração/tag; cada
+        pedaço ÍMPAR (1, 3, 5...) é fala.
+
+        BUG CORRIGIDO (2/2): mas "narração/tag" não é sempre "narrator"!
+        Em livros narrados na 1ª pessoa (comum em contos/novelas em que o
+        capítulo é contado por uma das personagens, ex.: "Abraço-a forte...",
+        "sussurro em seu ouvido..."), a tag entre travessões é a própria
+        ação/reação da personagem-narradora daquela cena, não do "narrator"
+        genérico do sistema — atribuí-la a "narrator" trocaria a voz a meio
+        da cena. Por isso cada pedaço PAR só vai para "narrator" se parecer
+        claramente descrição em 3ª pessoa; se parecer 1ª pessoa, mantém-se
+        com o `cid` original do segmento (ver `_looks_like_first_person_tag`).
+        """
+        parts = []
+        segments = text.split("—")
+        for i, part in enumerate(segments):
+            part = part.strip()
+            if not part:
+                continue
+            if i % 2 == 0:
+                if _looks_like_first_person_tag(part):
+                    parts.append({"text": part, "character_id": cid})
+                else:
+                    parts.append({"text": part, "character_id": "narrator"})
+            else:
+                parts.append({"text": part, "character_id": cid})
+        return parts if parts else [{"text": text, "character_id": cid}]
+
+    def merge_split_segments(seg_list: List[Dict]) -> List[Dict]:
+            """
+            Junta segmentos consecutivos cortados a meio de uma frase.
+            Critério: o anterior termina com palavra incompleta (sem pontuação final)
+            e o seguinte começa com minúscula.
+
+            BUG CORRIGIDO: faltava verificar se os dois segmentos pertencem ao
+            MESMO falante. Sem essa verificação, isto desfazia o split correto
+            de "— fala — tag." (ex.: "Eu disse que viria mais tarde" [maria] +
+            "respondeu ela." [narrator] cumpre o critério de "frase cortada" —
+            sem pontuação final + minúscula a seguir — e era remendado de volta
+            num único segmento, perdendo a separação fala/narração). Esta função
+            destina-se apenas a juntar cortes de bloco dentro da MESMA voz.
+            """
+            merged = []
+            i = 0
+            while i < len(seg_list):
+                if i + 1 < len(seg_list):
+                    cur = seg_list[i].get("text", "").strip()
+                    nxt = seg_list[i+1].get("text", "").strip()
+                    same_speaker = seg_list[i].get("character_id") == seg_list[i+1].get("character_id")
+                    if (same_speaker and cur and nxt
+                            and not re.search(r'[.!?…]\s*$', cur) and nxt[0].islower()):
+                        seg_list[i]["text"] = cur + " " + nxt
+                        del seg_list[i+1]
+                        continue
+                merged.append(seg_list[i])
+                i += 1
+            return merged
+
+        # ── Processar cada segmento ──────────────────────────────────────────────
+    corrected = []
+
+    for seg in segments:
+            if not isinstance(seg, dict):
+                corrected.append(seg)
+                continue
+
+            text = seg.get("text", "")
+            cid = seg.get("character_id", "narrator")
+            emotion = seg.get("emotion", "neutral")
+            pace = seg.get("pace", 1.0)
+            pause_ms = seg.get("pause_ms", 0)
+
+            # ── Dividir segmentos que combinam fala e narração ──────────────────
+            # BUG CORRIGIDO: a condição anterior só dividia quando o texto NÃO
+            # começava por travessão, partindo do princípio de que "começa com
+            # travessão" = "é só fala, sem nada a separar". Isso está errado
+            # para o padrão mais comum em PT-PT: "— fala — tag/narração.",
+            # que começa por travessão MAS tem uma tag narrativa no fim (ex.:
+            # "— Eu já vou — respondeu ela.") que ficava indevidamente colada
+            # à fala da personagem. Agora divide-se sempre que há travessão;
+            # _split_combined_segment lida corretamente com o pedaço vazio
+            # inicial quando o texto começa por "—".
+            if "—" in text:
+                split_parts = _split_combined_segment(text, cid, emotion)
+                for part in split_parts:
+                    corrected.append({
+                        "text": part["text"],
+                        "character_id": part["character_id"],
+                        "emotion": emotion,
+                        "pace": pace,
+                        "pause_ms": pause_ms
+                    })
+            else:
+                # Manter o segmento, mas com character_id possivelmente genérico
+                seg["character_id"] = cid
+                corrected.append(seg)
+
+        # ── Juntar segmentos cortados ──────────────────────────────────────────
+    corrected = merge_split_segments(corrected)
+    corrected = fix_first_person_narration_misattributed_to_narrator(characters, corrected)
+
+    return corrected

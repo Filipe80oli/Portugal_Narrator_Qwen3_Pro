@@ -6,6 +6,7 @@
 # • Cache de segmentos: reutiliza WAVs já gerados em runs anteriores (verificação rápida)
 import subprocess
 import re
+import shutil
 import asyncio
 import logging
 from pathlib import Path
@@ -493,20 +494,17 @@ class TTSEngine:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def clone_with_emotion(self, text: str, ref_audio: str|None,
-                        emotion: str, pace: float, out_path: str,
-                        ref_text: str="",
-                        voice_description: str="") -> bool:
+                       emotion: str, pace: float, out_path: str,
+                       ref_text: str="",
+                       voice_description: str="") -> bool:
         """Clona voz com retry automático e temperature muito baixa para evitar ruído."""
         
-        # VALIDAÇÃO CRÍTICA: Evitar usar texto da âncora como conteúdo
         from config.settings import ANCHOR_TEXT
         if text.strip() == ANCHOR_TEXT.strip():
             self.log(f"   ⚠️ Tentativa de usar texto de âncora como conteúdo - corrigindo...")
-            # Se for exatamente o texto da âncora, usar VoiceDesign direto
             desc = voice_description or "Voz neutra, português de Portugal, sotaque de Lisboa."
             return self.generate_design(text, desc, emotion, out_path)
         
-        # Evitar textos muito curtos que possam ser de âncoras
         if len(text.strip()) < 20 and "portugal" in text.lower() and "sotaque" in text.lower():
             self.log(f"   ⚠️ Texto suspeito de ser âncora detectado - usando VoiceDesign")
             desc = voice_description or "Voz neutra, português de Portugal, sotaque de Lisboa."
@@ -516,7 +514,6 @@ class TTSEngine:
             desc = voice_description or "Voz neutra, português de Portugal, sotaque de Lisboa."
             return self.generate_design(text, desc, emotion, out_path)
 
-        # Temperature muito mais baixa + tokens limitados para evitar ruído
         base_temp = 0.15
         max_tokens = TTS_MAX_NEW_TOKENS  
         
@@ -529,11 +526,8 @@ class TTSEngine:
                     temperature=temp, top_p=0.85, max_new_tokens=max_tokens,
                 )
                 kwargs["ref_text"] = ref_text if ref_text else ANCHOR_TEXT
-                # instruct reforça PT-PT mesmo na clonagem
                 if voice_description:
-                    kwargs["instruct"] = (
-                        f"{voice_description}{PTPT_ACCENT_SUFFIX}"
-                    )
+                    kwargs["instruct"] = f"{voice_description}{PTPT_ACCENT_SUFFIX}"
                 else:
                     kwargs["instruct"] = (
                         "Sotaque de Portugal continental. Português europeu. "
@@ -552,16 +546,15 @@ class TTSEngine:
                 self.log(f"   ⚠️ Tentativa {attempt} falhou, tentando novamente...")
                 continue
 
-            # Verificação adicional: garantir que o arquivo foi criado
             if not Path(out_path).exists():
                 self.log(f"   ❌ Arquivo de saída não foi criado: {out_path}")
-                if attempt == TTS_MAX_RETRIES: return False
+                if attempt == TTS_MAX_RETRIES: 
+                    return False
                 continue
                 
-            # VALIDAÇÃO MAIS RIGOROSA
+            # VALIDAÇÃO
             q = validate_audio(out_path, text)
             if q.ok:
-                # Verificação extra: conteúdo realmente corresponde ao texto solicitado?
                 if self._verify_content_match(out_path, text):
                     self.log(f"   ✅ Áudio validado: {q}")
                     return True
@@ -569,14 +562,15 @@ class TTSEngine:
                     self.log(f"   ⚠️ Conteúdo não corresponde ao texto solicitado")
             else:
                 self.log(f"   ⚠️ Validação falhou na tentativa {attempt}: {q.reason}")
-                # Remover arquivo ruim
-                Path(out_path).unlink(missing_ok=True)
-                
-            # Se for a última tentativa, mesmo com falha na validação, verificar se o arquivo existe
+                if attempt < TTS_MAX_RETRIES:
+                    Path(out_path).unlink(missing_ok=True)
+
+            # Última tentativa - aceitar se ficheiro existe
             if attempt == TTS_MAX_RETRIES:
                 if Path(out_path).exists() and Path(out_path).stat().st_size > 1024:
                     self.log(f"   ⚠️ Validação falhou mas arquivo parece válido, aceitando...")
                     return True
+                Path(out_path).unlink(missing_ok=True)
                 return False
 
         return False
@@ -596,7 +590,7 @@ class TTSEngine:
 
         self.log(f"   🎤 Gerando voz com prompt: {prompt[:80]}...")
 
-        # 2. Gerar áudio
+        # 2. Gerar áudio com retry
         for attempt in range(1, TTS_MAX_RETRIES + 1):
             try:
                 wavs, sr = self.model_design.generate_voice_design(
@@ -623,15 +617,28 @@ class TTSEngine:
                 # 4. Validar qualidade
                 q = validate_audio(out_path, text)
                 if q.ok:
+                    self.log(f"   ✅ Áudio validado: {q}")
                     return True
                 else:
+                    self.log(f"   ⚠️ Validação falhou na tentativa {attempt}: {q.reason}")
+                    # Só apaga se não for a última tentativa
+                    if attempt < TTS_MAX_RETRIES:
+                        Path(out_path).unlink(missing_ok=True)
+
+                # Se for a última tentativa, aceitar se o ficheiro existir e tiver tamanho razoável
+                if attempt == TTS_MAX_RETRIES:
+                    if Path(out_path).exists() and Path(out_path).stat().st_size > 1024:
+                        self.log(f"   ⚠️ Validação falhou mas arquivo parece válido, aceitando...")
+                        return True
                     Path(out_path).unlink(missing_ok=True)
-                    temp += 0.03
-                    self.log(f"   ⚠️ Validação falhou, tentativa {attempt} com temp={temp:.2f}")
+                    return False
 
             except Exception as e:
                 self.log(f"   ❌ Erro na tentativa {attempt}: {e}")
-                temp += 0.05
+                if attempt < TTS_MAX_RETRIES:
+                    temp += 0.03
+                    continue
+                return False
 
         return False
 
